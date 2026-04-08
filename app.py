@@ -59,6 +59,7 @@ players = {name: _make_player(sims) for name, sims in DIFFICULTY_PRESETS.items()
 games: dict[str, chess.Board] = {}
 game_histories: dict[str, list[dict]] = {}
 game_difficulty: dict[str, str] = {}
+completed_games: list[dict] = []  # Archive of finished games
 
 
 def _get_evaluation(board: chess.Board) -> float:
@@ -195,6 +196,7 @@ def make_move():
     })
 
     if board.is_game_over():
+        _archive_game(game_id, board)
         return jsonify(board_to_json(board, game_id))
 
     # --- AI reply ---
@@ -206,6 +208,7 @@ def make_move():
     elapsed_ms = int((time.time() - start) * 1000)
 
     if ai_move is None:
+        _archive_game(game_id, board)
         return jsonify(board_to_json(board, game_id, elapsed_ms))
 
     san_ai = board.san(ai_move)
@@ -217,6 +220,9 @@ def make_move():
         "time_ms": elapsed_ms,
     })
 
+    if board.is_game_over():
+        _archive_game(game_id, board)
+
     return jsonify(board_to_json(board, game_id, elapsed_ms))
 
 
@@ -227,6 +233,30 @@ def get_state():
     if board is None:
         return jsonify({"error": "Game not found"}), 404
     return jsonify(board_to_json(board, game_id))
+
+
+def _archive_game(game_id: str, board: chess.Board):
+    """Save a completed game to the archive."""
+    if any(g["game_id"] == game_id for g in completed_games):
+        return  # Already archived
+    result = board.result() if board.is_game_over() else "*"
+    outcome = board.outcome()
+    completed_games.append({
+        "game_id": game_id,
+        "result": result,
+        "termination": outcome.termination.name if outcome else None,
+        "difficulty": game_difficulty.get(game_id, "hard"),
+        "history": game_histories.get(game_id, []),
+        "fen": board.fen(),
+        "total_moves": len(game_histories.get(game_id, [])),
+    })
+    print(f"Game archived: {game_id} result={result}")
+
+
+@app.route("/api/games", methods=["GET"])
+def list_games():
+    """List all completed games."""
+    return jsonify({"games": completed_games})
 
 
 # ---------------------------------------------------------------------------

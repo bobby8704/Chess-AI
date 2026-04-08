@@ -691,11 +691,14 @@ def _apply_heuristic_boosts(
                     boost = 0.15 + 0.35 * closeness
                     move_probs[move] = max(move_probs[move], boost)
 
-        # --- 5. Boost checks (forcing moves are tactically strong) ---
+        # --- 5. Boost checks, penalize stalemate ---
         board_after = board.copy()
         board_after.push(move)
         if board_after.is_checkmate():
             move_probs[move] = max(move_probs[move], 0.95)
+        elif board_after.is_stalemate():
+            # Stalemate is almost always terrible when we're ahead
+            move_probs[move] *= 0.001
         elif board_after.is_check():
             move_probs[move] = max(move_probs[move], 0.12)
 
