@@ -248,8 +248,8 @@ def is_blunder_move(board: chess.Board, move: chess.Move) -> Tuple[bool, float]:
             net_exchange = captured_value - attacker_value
 
             # If we're losing material in the exchange, it's a blunder
-            # E.g., Queen (9) takes Bishop (3), they recapture Queen = -6 for us
-            if net_exchange < -2.0:  # Losing more than 2 pawns worth
+            # E.g., Rook(5) takes Bishop(3.25), they recapture = -1.75 for us
+            if net_exchange < -1.5:  # Losing more than 1.5 pawns worth
                 return True, -net_exchange
 
     # Make the move temporarily
@@ -626,6 +626,97 @@ class MCTS:
         }
 
 
+def _apply_heuristic_boosts(
+    board: chess.Board,
+    move_probs: Dict[chess.Move, float]
+) -> Dict[chess.Move, float]:
+    """
+    Apply heuristic policy adjustments to compensate for NN weaknesses.
+    Boosts/penalizes specific move types based on chess principles.
+    """
+    move_number = board.fullmove_number
+    our_color = board.turn
+
+    for move in list(move_probs.keys()):
+        piece = board.piece_at(move.from_square)
+        if piece is None:
+            continue
+
+        # --- 1. Boost captures of undefended / winning exchanges ---
+        if board.is_capture(move):
+            captured = board.piece_at(move.to_square)
+            if captured:
+                captured_val = PIECE_VALUES.get(captured.piece_type, 0)
+                attacker_val = PIECE_VALUES.get(piece.piece_type, 0)
+                opponent = not our_color
+                is_defended = board.is_attacked_by(opponent, move.to_square)
+                if not is_defended and captured_val >= 3.0:
+                    move_probs[move] = max(move_probs[move], 0.3)
+                elif is_defended and captured_val > attacker_val + 1.0:
+                    move_probs[move] = max(move_probs[move], 0.2)
+
+        # --- 2. Boost castling in the opening ---
+        if board.is_castling(move) and move_number <= 15:
+            # Strong boost — castling is almost always good in the opening
+            move_probs[move] = max(move_probs[move], 0.25)
+
+        # --- 3. Penalize early queen trades at equal material ---
+        if board.is_capture(move) and piece.piece_type == chess.QUEEN:
+            captured = board.piece_at(move.to_square)
+            if captured and captured.piece_type == chess.QUEEN:
+                # Check if opponent can recapture (making it a trade)
+                board_after = board.copy()
+                board_after.push(move)
+                can_recapture = any(
+                    m.to_square == move.to_square and board_after.is_capture(m)
+                    for m in board_after.legal_moves
+                )
+                if can_recapture and move_number <= 20:
+                    # Check material balance — trading is OK when ahead
+                    material = calculate_material(board)
+                    our_advantage = material if our_color == chess.WHITE else -material
+                    if our_advantage < 3.0:  # Not significantly ahead
+                        move_probs[move] *= 0.3  # Penalize queen trade
+
+        # --- 4. Boost passed pawn pushes in endgames ---
+        if piece.piece_type == chess.PAWN and not board.is_capture(move):
+            total_pieces = len(board.piece_map())
+            if total_pieces <= 16:  # Endgame-ish (half or fewer pieces)
+                if _is_passed_pawn(board, move.from_square, our_color):
+                    to_rank = chess.square_rank(move.to_square)
+                    # How close to promotion? (rank 7 for white, rank 0 for black)
+                    if our_color == chess.WHITE:
+                        closeness = to_rank / 7.0
+                    else:
+                        closeness = (7 - to_rank) / 7.0
+                    # Stronger boost the closer to promotion
+                    boost = 0.15 + 0.35 * closeness
+                    move_probs[move] = max(move_probs[move], boost)
+
+    return move_probs
+
+
+def _is_passed_pawn(board: chess.Board, square: chess.Square, color: chess.Color) -> bool:
+    """Check if a pawn on the given square is a passed pawn (no opposing pawns blocking or adjacent)."""
+    file = chess.square_file(square)
+    rank = chess.square_rank(square)
+    opponent = not color
+
+    # Check files: same file and adjacent files
+    for f in range(max(0, file - 1), min(7, file + 1) + 1):
+        # Check all ranks ahead of this pawn
+        if color == chess.WHITE:
+            check_ranks = range(rank + 1, 8)
+        else:
+            check_ranks = range(0, rank)
+        for r in check_ranks:
+            sq = chess.square(f, r)
+            p = board.piece_at(sq)
+            if p and p.piece_type == chess.PAWN and p.color == opponent:
+                return False
+    return True
+
+
 class MCTSPlayer:
     """
     Chess player using MCTS with neural network.
@@ -692,23 +783,8 @@ class MCTSPlayer:
             if idx < POLICY_OUTPUT_SIZE:
                 move_probs[move] = float(policy_probs[idx])
 
-        # Boost captures of undefended pieces (NN may undervalue tactics)
-        for move in list(move_probs.keys()):
-            if board.is_capture(move):
-                captured = board.piece_at(move.to_square)
-                if captured:
-                    captured_val = PIECE_VALUES.get(captured.piece_type, 0)
-                    attacker = board.piece_at(move.from_square)
-                    attacker_val = PIECE_VALUES.get(attacker.piece_type, 0) if attacker else 0
-                    # Check if captured piece is undefended
-                    opponent = not board.turn
-                    is_defended = board.is_attacked_by(opponent, move.to_square)
-                    if not is_defended and captured_val >= 3.0:
-                        # Free piece: give it a strong prior boost
-                        move_probs[move] = max(move_probs[move], 0.3)
-                    elif is_defended and captured_val > attacker_val + 1.0:
-                        # Winning exchange (e.g., pawn takes queen)
-                        move_probs[move] = max(move_probs[move], 0.2)
+        # === Heuristic policy adjustments (compensate for NN weaknesses) ===
+        move_probs = _apply_heuristic_boosts(board, move_probs)
 
         # Apply hybrid material evaluation if enabled
         if self.config.use_material_eval:
