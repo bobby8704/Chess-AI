@@ -12,7 +12,7 @@ import chess
 from flask import Flask, jsonify, request, render_template, send_from_directory
 
 from neural_network import load_dual_model
-from mcts import MCTSPlayer, MCTSConfig
+from mcts import MCTSPlayer, MCTSConfig, evaluate_material_safety
 
 # ---------------------------------------------------------------------------
 # App & AI initialisation
@@ -22,7 +22,13 @@ app = Flask(__name__)
 
 # Load the trained model once at startup
 MODEL_PATH = "models/dual_model_mcts.pt"
-DEFAULT_SIMS = 300  # simulations per move (balance speed vs strength)
+
+# Difficulty presets: name -> simulations
+DIFFICULTY_PRESETS = {
+    "easy": 50,
+    "medium": 150,
+    "hard": 300,
+}
 
 print("Loading chess AI model...")
 try:
@@ -32,22 +38,42 @@ except Exception as e:
     print(f"WARNING: Could not load model ({e}). AI will use uniform policy.")
     dual_model = None
 
-mcts_config = MCTSConfig(
-    num_simulations=DEFAULT_SIMS,
-    temperature=0,  # Greedy — always pick the best move
-    add_noise=False,
-)
-mcts_player = MCTSPlayer(model=dual_model, config=mcts_config)
+
+def _make_player(num_sims: int) -> MCTSPlayer:
+    """Create an MCTS player with the given simulation count."""
+    config = MCTSConfig(
+        num_simulations=num_sims,
+        temperature=0,
+        add_noise=False,
+    )
+    return MCTSPlayer(model=dual_model, config=config)
+
+
+# Pre-create players for each difficulty
+players = {name: _make_player(sims) for name, sims in DIFFICULTY_PRESETS.items()}
 
 # ---------------------------------------------------------------------------
-# In-memory game sessions  {game_id: chess.Board}
+# In-memory game sessions
 # ---------------------------------------------------------------------------
 
 games: dict[str, chess.Board] = {}
 game_histories: dict[str, list[dict]] = {}
+game_difficulty: dict[str, str] = {}
 
 
-def board_to_json(board: chess.Board, game_id: str) -> dict:
+def _get_evaluation(board: chess.Board) -> float:
+    """Get position evaluation from White's perspective (-1 to +1)."""
+    if dual_model is None:
+        return 0.0
+    val = evaluate_material_safety(board)
+    # evaluate_material_safety returns from current player's perspective
+    # Convert to White's perspective for the UI
+    if board.turn == chess.BLACK:
+        val = -val
+    return round(val, 3)
+
+
+def board_to_json(board: chess.Board, game_id: str, ai_time_ms: int = 0) -> dict:
     """Serialise the current board state for the frontend."""
     status = "playing"
     result = None
@@ -81,6 +107,9 @@ def board_to_json(board: chess.Board, game_id: str) -> dict:
         "move_number": board.fullmove_number,
         "history": game_histories.get(game_id, []),
         "legal_moves": [m.uci() for m in board.legal_moves],
+        "evaluation": _get_evaluation(board),
+        "ai_time_ms": ai_time_ms,
+        "difficulty": game_difficulty.get(game_id, "hard"),
     }
 
 
@@ -93,7 +122,6 @@ def index():
     return render_template("index.html")
 
 
-# Map chessboard.js piece codes (e.g. "wP") to our local image filenames
 _PIECE_FILE_MAP = {
     "wP": "w_pawn.png",   "wR": "w_rook.png",  "wN": "w_knight.png",
     "wB": "w_bishop.png", "wQ": "w_queen.png",  "wK": "w_king.png",
@@ -103,7 +131,6 @@ _PIECE_FILE_MAP = {
 
 @app.route("/img/pieces/<piece>.png")
 def piece_image(piece):
-    """Serve chess piece images, mapping chessboard.js names to local files."""
     filename = _PIECE_FILE_MAP.get(piece)
     if filename is None:
         return "Not found", 404
@@ -112,11 +139,17 @@ def piece_image(piece):
 
 @app.route("/api/new-game", methods=["POST"])
 def new_game():
-    """Start a new game. Returns the initial board state."""
+    """Start a new game. Accepts optional {"difficulty": "easy|medium|hard"}."""
+    data = request.get_json(silent=True) or {}
+    difficulty = data.get("difficulty", "hard")
+    if difficulty not in DIFFICULTY_PRESETS:
+        difficulty = "hard"
+
     game_id = uuid.uuid4().hex[:12]
     board = chess.Board()
     games[game_id] = board
     game_histories[game_id] = []
+    game_difficulty[game_id] = difficulty
     return jsonify(board_to_json(board, game_id))
 
 
@@ -126,7 +159,6 @@ def make_move():
     Accept a human move, apply it, then compute and apply the AI reply.
 
     Expects JSON: {"game_id": "...", "move": "e2e4"}
-    Returns the updated board state (after both moves).
     """
     data = request.get_json(force=True)
     game_id = data.get("game_id")
@@ -146,7 +178,6 @@ def make_move():
         return jsonify({"error": f"Invalid UCI string: {uci_str}"}), 400
 
     if human_move not in board.legal_moves:
-        # Try with promotion variants
         for promo in ["q", "r", "b", "n"]:
             promo_move = chess.Move.from_uci(uci_str[:4] + promo)
             if promo_move in board.legal_moves:
@@ -163,17 +194,19 @@ def make_move():
         "uci": human_move.uci(),
     })
 
-    # --- Check if game ended after human move ---
     if board.is_game_over():
         return jsonify(board_to_json(board, game_id))
 
     # --- AI reply ---
+    difficulty = game_difficulty.get(game_id, "hard")
+    player = players.get(difficulty, players["hard"])
+
     start = time.time()
-    ai_move = mcts_player.select_move(board)
+    ai_move = player.select_move(board)
     elapsed_ms = int((time.time() - start) * 1000)
 
     if ai_move is None:
-        return jsonify(board_to_json(board, game_id))
+        return jsonify(board_to_json(board, game_id, elapsed_ms))
 
     san_ai = board.san(ai_move)
     board.push(ai_move)
@@ -184,12 +217,11 @@ def make_move():
         "time_ms": elapsed_ms,
     })
 
-    return jsonify(board_to_json(board, game_id))
+    return jsonify(board_to_json(board, game_id, elapsed_ms))
 
 
 @app.route("/api/state", methods=["GET"])
 def get_state():
-    """Get the current state of a game."""
     game_id = request.args.get("game_id")
     board = games.get(game_id)
     if board is None:

@@ -12,7 +12,6 @@
   />
 
   <style>
-    /* ---------- reset & base ---------- */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
@@ -25,106 +24,119 @@
       align-items: center;
     }
 
-    /* ---------- header ---------- */
     header {
       width: 100%;
       text-align: center;
       padding: 24px 16px 12px;
     }
-    header h1 {
-      font-size: 1.8rem;
-      font-weight: 700;
-      color: #ffffff;
-      letter-spacing: 0.02em;
-    }
+    header h1 { font-size: 1.8rem; font-weight: 700; color: #fff; letter-spacing: 0.02em; }
     header h1 span { color: #4fc3f7; }
-    header p {
-      margin-top: 4px;
-      font-size: 0.9rem;
-      color: #9e9e9e;
-    }
+    header p { margin-top: 4px; font-size: 0.9rem; color: #9e9e9e; }
 
-    /* ---------- layout ---------- */
     .game-container {
       display: flex;
       flex-wrap: wrap;
       justify-content: center;
       gap: 24px;
       padding: 16px;
-      max-width: 960px;
+      max-width: 1020px;
       width: 100%;
     }
 
-    /* ---------- board wrapper ---------- */
+    /* --- eval bar --- */
+    .eval-col { flex: 0 0 24px; display: flex; flex-direction: column; align-items: center; }
+    .eval-bar-wrap {
+      width: 24px; height: 480px;
+      background: #333;
+      border-radius: 4px;
+      overflow: hidden;
+      position: relative;
+      border: 1px solid #444;
+    }
+    .eval-bar-fill {
+      position: absolute; bottom: 0; left: 0; right: 0;
+      background: #e0e0e0;
+      transition: height 0.5s ease;
+    }
+    .eval-label {
+      margin-top: 6px;
+      font-size: 0.75rem;
+      color: #9e9e9e;
+      font-family: 'Consolas', monospace;
+    }
+
     .board-section { flex: 0 0 auto; }
+    #board { width: 480px; height: 480px; }
 
-    #board {
-      width: 480px;
-      height: 480px;
-    }
+    /* move highlights */
+    .highlight-source { box-shadow: inset 0 0 0 4px rgba(79,195,247,0.75); }
+    .highlight-target { background: radial-gradient(circle, rgba(79,195,247,0.45) 24%, transparent 25%) !important; }
+    .highlight-capture { background: radial-gradient(circle, transparent 52%, rgba(79,195,247,0.45) 53%, rgba(79,195,247,0.45) 64%, transparent 65%) !important; }
+    .highlight-last-from { box-shadow: inset 0 0 0 4px rgba(255,235,59,0.45); }
+    .highlight-last-to { box-shadow: inset 0 0 0 4px rgba(255,235,59,0.45); }
 
-    /* ---------- move highlights ---------- */
-    .highlight-source {
-      box-shadow: inset 0 0 0 4px rgba(79, 195, 247, 0.75);
-    }
-    .highlight-target {
-      background: radial-gradient(circle, rgba(79, 195, 247, 0.45) 24%, transparent 25%) !important;
-    }
-    .highlight-capture {
-      background: radial-gradient(circle, transparent 52%, rgba(79, 195, 247, 0.45) 53%, rgba(79, 195, 247, 0.45) 64%, transparent 65%) !important;
-    }
-    .highlight-last-from {
-      box-shadow: inset 0 0 0 4px rgba(255, 235, 59, 0.45);
-    }
-    .highlight-last-to {
-      box-shadow: inset 0 0 0 4px rgba(255, 235, 59, 0.45);
-    }
-
-    /* ---------- sidebar ---------- */
     .sidebar {
       flex: 1 1 240px;
       max-width: 320px;
       display: flex;
       flex-direction: column;
-      gap: 16px;
+      gap: 14px;
     }
 
-    /* ---------- status bar ---------- */
     .status-bar {
       background: #16213e;
       border-radius: 10px;
-      padding: 16px 20px;
+      padding: 14px 18px;
       text-align: center;
     }
-    #status-text {
-      font-size: 1.1rem;
-      font-weight: 600;
-      min-height: 1.4em;
-    }
+    #status-text { font-size: 1.05rem; font-weight: 600; min-height: 1.4em; }
     .status-bar.check   #status-text { color: #ff9800; }
     .status-bar.gameover #status-text { color: #ef5350; }
     .status-bar.playing  #status-text { color: #66bb6a; }
     .status-bar.thinking #status-text { color: #4fc3f7; }
 
-    /* ---------- buttons ---------- */
-    .actions { display: flex; gap: 10px; }
-    .btn {
+    /* --- AI info row --- */
+    .ai-info {
+      display: flex;
+      justify-content: space-between;
+      background: #16213e;
+      border-radius: 10px;
+      padding: 10px 18px;
+      font-size: 0.85rem;
+      color: #9e9e9e;
+    }
+    .ai-info strong { color: #e0e0e0; }
+
+    /* --- difficulty picker --- */
+    .difficulty-row {
+      display: flex;
+      gap: 8px;
+    }
+    .diff-btn {
       flex: 1;
-      padding: 12px 0;
-      border: none;
+      padding: 9px 0;
+      border: 2px solid #2d2d44;
       border-radius: 8px;
-      font-size: 0.95rem;
+      background: transparent;
+      color: #9e9e9e;
+      font-size: 0.85rem;
       font-weight: 600;
       cursor: pointer;
+      transition: all 0.15s;
+    }
+    .diff-btn:hover { border-color: #4fc3f7; color: #e0e0e0; }
+    .diff-btn.active { border-color: #4fc3f7; background: rgba(79,195,247,0.15); color: #4fc3f7; }
+
+    .actions { display: flex; gap: 10px; }
+    .btn {
+      flex: 1; padding: 12px 0; border: none; border-radius: 8px;
+      font-size: 0.95rem; font-weight: 600; cursor: pointer;
       transition: background 0.15s, transform 0.1s;
     }
     .btn:active { transform: scale(0.97); }
-    .btn-primary  { background: #4fc3f7; color: #1a1a2e; }
-    .btn-primary:hover  { background: #81d4fa; }
-    .btn-secondary { background: #2d2d44; color: #e0e0e0; }
-    .btn-secondary:hover { background: #3a3a55; }
+    .btn-primary { background: #4fc3f7; color: #1a1a2e; }
+    .btn-primary:hover { background: #81d4fa; }
 
-    /* ---------- move list ---------- */
     .move-list-container {
       background: #16213e;
       border-radius: 10px;
@@ -132,55 +144,44 @@
       flex: 1;
       display: flex;
       flex-direction: column;
-      min-height: 200px;
-      max-height: 380px;
+      min-height: 180px;
+      max-height: 340px;
     }
     .move-list-container h3 {
-      font-size: 0.85rem;
+      font-size: 0.8rem;
       text-transform: uppercase;
       letter-spacing: 0.08em;
       color: #9e9e9e;
-      margin-bottom: 10px;
+      margin-bottom: 8px;
     }
     #move-list {
-      flex: 1;
-      overflow-y: auto;
+      flex: 1; overflow-y: auto;
       font-family: 'Consolas', 'Courier New', monospace;
-      font-size: 0.9rem;
-      line-height: 1.7;
+      font-size: 0.85rem; line-height: 1.7;
     }
     .move-row { display: flex; gap: 8px; }
-    .move-num  { color: #616161; min-width: 30px; text-align: right; }
-    .move-white { color: #ffffff; min-width: 60px; }
+    .move-num { color: #616161; min-width: 30px; text-align: right; }
+    .move-white { color: #fff; min-width: 60px; }
     .move-black { color: #b0bec5; min-width: 60px; }
 
-    /* ---------- thinking spinner ---------- */
     .spinner {
-      display: inline-block;
-      width: 18px; height: 18px;
-      border: 3px solid rgba(79,195,247,0.3);
-      border-top-color: #4fc3f7;
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-      vertical-align: middle;
-      margin-right: 8px;
+      display: inline-block; width: 18px; height: 18px;
+      border: 3px solid rgba(79,195,247,0.3); border-top-color: #4fc3f7;
+      border-radius: 50%; animation: spin 0.8s linear infinite;
+      vertical-align: middle; margin-right: 8px;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    /* ---------- responsive ---------- */
-    @media (max-width: 640px) {
-      #board { width: 92vw; height: 92vw; }
+    @media (max-width: 700px) {
+      #board { width: 88vw; height: 88vw; }
+      .eval-bar-wrap { height: 88vw; }
       .sidebar { max-width: 92vw; }
       header h1 { font-size: 1.4rem; }
     }
 
-    /* ---------- footer ---------- */
     footer {
-      margin-top: auto;
-      padding: 20px;
-      text-align: center;
-      font-size: 0.8rem;
-      color: #616161;
+      margin-top: auto; padding: 20px;
+      text-align: center; font-size: 0.8rem; color: #616161;
     }
   </style>
 </head>
@@ -192,6 +193,14 @@
   </header>
 
   <div class="game-container">
+    <!-- Eval bar -->
+    <div class="eval-col">
+      <div class="eval-bar-wrap">
+        <div class="eval-bar-fill" id="eval-fill" style="height:50%"></div>
+      </div>
+      <div class="eval-label" id="eval-label">0.0</div>
+    </div>
+
     <!-- Board -->
     <div class="board-section">
       <div id="board"></div>
@@ -203,9 +212,19 @@
         <div id="status-text">Click "New Game" to start</div>
       </div>
 
+      <div class="ai-info">
+        <div>Think time: <strong id="think-time">-</strong></div>
+        <div>Move: <strong id="move-num">-</strong></div>
+      </div>
+
+      <div class="difficulty-row">
+        <button class="diff-btn" data-diff="easy" onclick="setDifficulty('easy')">Easy</button>
+        <button class="diff-btn" data-diff="medium" onclick="setDifficulty('medium')">Medium</button>
+        <button class="diff-btn active" data-diff="hard" onclick="setDifficulty('hard')">Hard</button>
+      </div>
+
       <div class="actions">
         <button class="btn btn-primary" id="btn-new" onclick="newGame()">New Game</button>
-        <button class="btn btn-secondary" id="btn-undo" onclick="undoMove()" disabled>Undo</button>
       </div>
 
       <div class="move-list-container">
@@ -219,143 +238,113 @@
     Powered by MCTS + dual neural network &middot; Built with chessboard.js
   </footer>
 
-  <!-- Libraries -->
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
 
   <script>
-    // ===================== State =====================
     let gameId = null;
-    let game = new Chess();       // client-side validation
-    let board = null;             // chessboard.js instance
+    let game = new Chess();
+    let board = null;
     let thinking = false;
-    let selectedSquare = null;    // currently highlighted source square
-    let lastMove = null;          // {from, to} of last AI move for highlighting
+    let lastMove = null;
+    let currentDifficulty = 'hard';
 
-    // ===================== Board config =====================
     const boardConfig = {
       draggable: true,
       position: 'start',
       pieceTheme: '/img/pieces/{piece}.png',
-      onDragStart: onDragStart,
-      onDrop: onDrop,
-      onSnapEnd: onSnapEnd,
-      onMouseoutSquare: onMouseoutSquare,
-      onMouseoverSquare: onMouseoverSquare,
+      onDragStart, onDrop, onSnapEnd,
+      onMouseoutSquare, onMouseoverSquare,
     };
-
     board = Chessboard('board', boardConfig);
-
-    // Resize board when window resizes
     $(window).on('resize', () => board.resize());
 
-    // ===================== Highlighting =====================
+    // ========== Difficulty ==========
+    function setDifficulty(diff) {
+      currentDifficulty = diff;
+      document.querySelectorAll('.diff-btn').forEach(b => b.classList.remove('active'));
+      document.querySelector(`[data-diff="${diff}"]`).classList.add('active');
+    }
+
+    // ========== Eval bar ==========
+    function updateEval(evaluation) {
+      // evaluation is -1 to +1 from White's perspective
+      // Convert to percentage (0.5 = even, 1.0 = white winning fully)
+      const pct = Math.max(2, Math.min(98, 50 + evaluation * 50));
+      document.getElementById('eval-fill').style.height = pct + '%';
+      const sign = evaluation >= 0 ? '+' : '';
+      document.getElementById('eval-label').textContent = sign + evaluation.toFixed(2);
+    }
+
+    // ========== Highlighting ==========
     function clearHighlights() {
       $('#board .square-55d63').removeClass(
         'highlight-source highlight-target highlight-capture highlight-last-from highlight-last-to'
       );
     }
-
     function showLastMove() {
       if (!lastMove) return;
       $('#board .square-' + lastMove.from).addClass('highlight-last-from');
       $('#board .square-' + lastMove.to).addClass('highlight-last-to');
     }
-
     function highlightLegalMoves(square) {
-      const moves = game.moves({ square: square, verbose: true });
-      if (moves.length === 0) return;
-
-      // Highlight source square
+      const moves = game.moves({ square, verbose: true });
+      if (!moves.length) return;
       $('#board .square-' + square).addClass('highlight-source');
-
-      // Highlight each target square
       for (const m of moves) {
-        if (m.captured) {
-          $('#board .square-' + m.to).addClass('highlight-capture');
-        } else {
-          $('#board .square-' + m.to).addClass('highlight-target');
-        }
+        $('#board .square-' + m.to).addClass(m.captured ? 'highlight-capture' : 'highlight-target');
       }
     }
 
-    // ===================== Board callbacks =====================
-    function onDragStart(source, piece, position, orientation) {
-      if (thinking) return false;
-      if (game.game_over()) return false;
-      // Only allow white pieces (human = white)
-      if (piece.search(/^b/) !== -1) return false;
-      if (game.turn() !== 'w') return false;
-
-      // Show legal moves for the dragged piece
+    // ========== Board callbacks ==========
+    function onDragStart(source, piece) {
+      if (thinking || game.game_over()) return false;
+      if (piece.search(/^b/) !== -1 || game.turn() !== 'w') return false;
       clearHighlights();
       highlightLegalMoves(source);
-      selectedSquare = source;
     }
-
     function onDrop(source, target) {
-      // Clear highlights
       clearHighlights();
-      selectedSquare = null;
-
-      // Try the move client-side first
-      const moveObj = game.move({
-        from: source,
-        to: target,
-        promotion: 'q',  // always promote to queen for simplicity
-      });
-
+      const moveObj = game.move({ from: source, to: target, promotion: 'q' });
       if (moveObj === null) return 'snapback';
-
-      // Undo client-side — we'll let the server be authoritative
       game.undo();
-
-      // Build UCI string
       let uci = source + target;
       if (moveObj.flags.includes('p')) uci += 'q';
-
       sendMove(uci);
     }
-
-    function onSnapEnd() {
-      board.position(game.fen());
-    }
-
+    function onSnapEnd() { board.position(game.fen()); }
     function onMouseoverSquare(square, piece) {
-      // Only show highlights on hover when it's our turn and not thinking
       if (thinking || game.game_over() || game.turn() !== 'w') return;
       if (!piece || piece.search(/^b/) !== -1) return;
-
-      clearHighlights();
-      showLastMove();
-      highlightLegalMoves(square);
+      clearHighlights(); showLastMove(); highlightLegalMoves(square);
     }
+    function onMouseoutSquare() { clearHighlights(); showLastMove(); }
 
-    function onMouseoutSquare(square, piece) {
-      clearHighlights();
-      showLastMove();
-    }
-
-    // ===================== API calls =====================
+    // ========== API ==========
     async function newGame() {
       thinking = false;
       lastMove = null;
       setStatus('Starting new game...', 'thinking');
+      updateEval(0);
+      document.getElementById('think-time').textContent = '-';
+      document.getElementById('move-num').textContent = '-';
 
       try {
-        const res = await fetch('/api/new-game', { method: 'POST' });
+        const res = await fetch('/api/new-game', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ difficulty: currentDifficulty }),
+        });
         const data = await res.json();
         gameId = data.game_id;
         game = new Chess();
         board.position('start');
         clearHighlights();
         renderMoves([]);
-        setStatus("Your turn — drag a white piece", 'playing');
-        document.getElementById('btn-undo').disabled = true;
+        setStatus("Your turn", 'playing');
       } catch (err) {
         setStatus('Error starting game', 'gameover');
-        console.error(err);
       }
     }
 
@@ -373,88 +362,64 @@
         });
         const data = await res.json();
 
-        if (data.error) {
-          setStatus(data.error, 'gameover');
-          thinking = false;
-          return;
-        }
+        if (data.error) { setStatus(data.error, 'gameover'); thinking = false; return; }
 
-        // Sync client game state from server FEN
         game = new Chess(data.fen);
-        board.position(data.fen, true);  // animate
+        board.position(data.fen, true);
 
-        // Track last AI move for highlighting
+        // Eval bar
+        if (data.evaluation !== undefined) updateEval(data.evaluation);
+
+        // AI info
+        if (data.ai_time_ms) {
+          const sec = (data.ai_time_ms / 1000).toFixed(1);
+          document.getElementById('think-time').textContent = sec + 's';
+        }
+        document.getElementById('move-num').textContent = data.move_number || '-';
+
+        // Last move highlight
         if (data.history && data.history.length >= 2) {
           const aiMove = data.history[data.history.length - 1];
           if (aiMove && aiMove.uci) {
-            lastMove = {
-              from: aiMove.uci.substring(0, 2),
-              to: aiMove.uci.substring(2, 4),
-            };
-            // Show last move highlight after animation completes
-            setTimeout(() => {
-              clearHighlights();
-              showLastMove();
-            }, 300);
+            lastMove = { from: aiMove.uci.substring(0,2), to: aiMove.uci.substring(2,4) };
+            setTimeout(() => { clearHighlights(); showLastMove(); }, 300);
           }
         }
 
-        // Render move list
         renderMoves(data.history);
 
-        // Update status
         if (data.is_game_over) {
           setStatus(capitalise(data.status), 'gameover');
-          document.getElementById('btn-undo').disabled = true;
         } else if (data.status === 'check') {
           setStatus("Check! Your turn", 'check');
         } else {
           setStatus("Your turn", 'playing');
         }
-
-        document.getElementById('btn-undo').disabled = data.is_game_over;
       } catch (err) {
         setStatus('Network error', 'gameover');
-        console.error(err);
       }
-
       thinking = false;
     }
 
-    async function undoMove() {
-      if (!gameId || thinking) return;
-      alert("Undo is not supported yet. Start a new game instead.");
-    }
-
-    // ===================== UI helpers =====================
+    // ========== UI helpers ==========
     function setStatus(html, cls) {
-      const bar = document.getElementById('status-bar');
-      bar.className = 'status-bar ' + cls;
+      document.getElementById('status-bar').className = 'status-bar ' + cls;
       document.getElementById('status-text').innerHTML = html;
     }
-
     function renderMoves(history) {
       const el = document.getElementById('move-list');
       let html = '';
       for (let i = 0; i < history.length; i += 2) {
-        const num = Math.floor(i / 2) + 1;
-        const white = history[i] ? history[i].san : '';
-        const black = history[i + 1] ? history[i + 1].san : '';
-        html += `<div class="move-row">
-          <span class="move-num">${num}.</span>
-          <span class="move-white">${white}</span>
-          <span class="move-black">${black}</span>
-        </div>`;
+        const num = Math.floor(i/2) + 1;
+        const w = history[i] ? history[i].san : '';
+        const b = history[i+1] ? history[i+1].san : '';
+        html += `<div class="move-row"><span class="move-num">${num}.</span><span class="move-white">${w}</span><span class="move-black">${b}</span></div>`;
       }
       el.innerHTML = html;
       el.scrollTop = el.scrollHeight;
     }
+    function capitalise(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 
-    function capitalise(s) {
-      return s.charAt(0).toUpperCase() + s.slice(1);
-    }
-
-    // Auto-start a game on load
     newGame();
   </script>
 </body>

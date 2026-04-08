@@ -684,14 +684,104 @@ def _apply_heuristic_boosts(
             if total_pieces <= 16:  # Endgame-ish (half or fewer pieces)
                 if _is_passed_pawn(board, move.from_square, our_color):
                     to_rank = chess.square_rank(move.to_square)
-                    # How close to promotion? (rank 7 for white, rank 0 for black)
                     if our_color == chess.WHITE:
                         closeness = to_rank / 7.0
                     else:
                         closeness = (7 - to_rank) / 7.0
-                    # Stronger boost the closer to promotion
                     boost = 0.15 + 0.35 * closeness
                     move_probs[move] = max(move_probs[move], boost)
+
+        # --- 5. Boost checks (forcing moves are tactically strong) ---
+        board_after = board.copy()
+        board_after.push(move)
+        if board_after.is_checkmate():
+            # Checkmate — make this overwhelmingly preferred
+            move_probs[move] = max(move_probs[move], 0.95)
+        elif board_after.is_check():
+            move_probs[move] = max(move_probs[move], 0.12)
+
+    # --- 6. Boost piece development in the opening ---
+    if move_number <= 12:
+        move_probs = _boost_development(board, move_probs, our_color)
+
+    # --- 7. King safety: penalize pawn pushes near castled king ---
+    move_probs = _penalize_king_shelter_weakening(board, move_probs, our_color)
+
+    return move_probs
+
+
+def _boost_development(
+    board: chess.Board,
+    move_probs: Dict[chess.Move, float],
+    color: chess.Color
+) -> Dict[chess.Move, float]:
+    """Boost moves that develop unplayed minor pieces in the opening."""
+    back_rank = 0 if color == chess.WHITE else 7
+
+    # Find minor pieces (knights/bishops) still on their starting squares
+    starting_minors = []
+    for file in range(8):
+        sq = chess.square(file, back_rank)
+        p = board.piece_at(sq)
+        if p and p.color == color and p.piece_type in (chess.KNIGHT, chess.BISHOP):
+            starting_minors.append(sq)
+
+    if not starting_minors:
+        return move_probs
+
+    for move, prob in list(move_probs.items()):
+        # Boost moves that move an undeveloped minor piece
+        if move.from_square in starting_minors:
+            move_probs[move] = max(prob, 0.12)
+
+        # Mildly penalize moving the queen early (before minor pieces are out)
+        piece = board.piece_at(move.from_square)
+        if piece and piece.piece_type == chess.QUEEN and len(starting_minors) >= 2:
+            if not board.is_capture(move):
+                move_probs[move] *= 0.6
+
+    return move_probs
+
+
+def _penalize_king_shelter_weakening(
+    board: chess.Board,
+    move_probs: Dict[chess.Move, float],
+    color: chess.Color
+) -> Dict[chess.Move, float]:
+    """Penalize pawn pushes that weaken the castled king's shelter."""
+    # Only apply if we've castled
+    king_sq = board.king(color)
+    if king_sq is None:
+        return move_probs
+
+    king_file = chess.square_file(king_sq)
+    king_rank = chess.square_rank(king_sq)
+
+    # Check if king is on a castled position (g1/g8 for kingside, c1/c8 for queenside)
+    is_castled_kingside = king_file >= 6 and king_rank in (0, 7)
+    is_castled_queenside = king_file <= 2 and king_rank in (0, 7)
+
+    if not is_castled_kingside and not is_castled_queenside:
+        return move_probs
+
+    # Determine which files shelter the king
+    if is_castled_kingside:
+        shelter_files = [5, 6, 7]  # f, g, h
+    else:
+        shelter_files = [0, 1, 2]  # a, b, c
+
+    shelter_rank = 1 if color == chess.WHITE else 6  # rank of shelter pawns
+
+    for move, prob in list(move_probs.items()):
+        piece = board.piece_at(move.from_square)
+        if piece is None or piece.piece_type != chess.PAWN:
+            continue
+        # If this pawn is on a shelter file and shelter rank, penalize pushing it
+        from_file = chess.square_file(move.from_square)
+        from_rank = chess.square_rank(move.from_square)
+        if from_file in shelter_files and from_rank == shelter_rank:
+            # Pushing shelter pawn — mild penalty (sometimes it's needed)
+            move_probs[move] *= 0.5
 
     return move_probs
 
