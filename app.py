@@ -22,7 +22,7 @@ app = Flask(__name__)
 
 # Load the trained model once at startup
 MODEL_PATH = "models/dual_model_mcts.pt"
-DEFAULT_SIMS = 100  # simulations per move (balance speed vs strength)
+DEFAULT_SIMS = 300  # simulations per move (balance speed vs strength)
 
 print("Loading chess AI model...")
 try:
@@ -34,7 +34,7 @@ except Exception as e:
 
 mcts_config = MCTSConfig(
     num_simulations=DEFAULT_SIMS,
-    temperature=0.1,
+    temperature=0,  # Greedy — always pick the best move
     add_noise=False,
 )
 mcts_player = MCTSPlayer(model=dual_model, config=mcts_config)

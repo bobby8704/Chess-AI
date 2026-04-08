@@ -93,28 +93,35 @@ def get_hanging_pieces(board: chess.Board, color: chess.Color) -> Dict[chess.Squ
 def evaluate_material_safety(board: chess.Board) -> float:
     """
     Evaluate position based on material and piece safety.
-    Returns a value from -1 to 1 (like neural network value).
+    Returns a value from -1 to 1 from the current player's perspective.
     """
-    # Calculate current material balance
+    # Calculate current material balance (positive = White advantage)
     material = calculate_material(board)
 
     # Get hanging pieces for both sides
-    white_hanging = get_hanging_pieces(board, chess.WHITE)
-    black_hanging = get_hanging_pieces(board, chess.BLACK)
+    # The side to move can capture opponent hanging pieces
+    current_color = board.turn
+    opponent_color = not board.turn
 
-    # Calculate potential material loss
-    white_at_risk = sum(white_hanging.values())
-    black_at_risk = sum(black_hanging.values())
+    current_hanging = get_hanging_pieces(board, current_color)
+    opponent_hanging = get_hanging_pieces(board, opponent_color)
 
-    # Adjust material by hanging pieces (opponent can take them)
-    adjusted_material = material - white_at_risk + black_at_risk
+    # Current player's hanging pieces are at risk; opponent's can be captured
+    current_at_risk = sum(current_hanging.values())
+    opponent_at_risk = sum(opponent_hanging.values())
 
-    # Convert to -1 to 1 scale (assuming ~40 points total material)
-    # Clamp to reasonable range
-    normalized = adjusted_material / 15.0  # ~1 queen + 1 rook difference = significant
-    normalized = max(-1.0, min(1.0, normalized))
+    # Adjust material from White's perspective
+    if current_color == chess.WHITE:
+        adjusted_material = material - current_at_risk + opponent_at_risk
+    else:
+        adjusted_material = material + current_at_risk - opponent_at_risk
 
-    return normalized
+    # Convert to current player's perspective, normalized to [-1, 1]
+    if current_color == chess.BLACK:
+        adjusted_material = -adjusted_material
+
+    normalized = adjusted_material / 15.0
+    return max(-1.0, min(1.0, normalized))
 
 
 def simple_see(board: chess.Board, square: chess.Square) -> float:
@@ -247,16 +254,31 @@ def is_blunder_move(board: chess.Board, move: chess.Move) -> Tuple[bool, float]:
 
     # Make the move temporarily
     board_copy = board.copy()
+
+    # Track material gained by this move (captures)
+    material_gained = 0.0
+    if board.is_capture(move):
+        captured_piece = board.piece_at(move.to_square)
+        if captured_piece:
+            material_gained = PIECE_VALUES.get(captured_piece.piece_type, 0)
+        elif board.piece_at(move.from_square) and board.piece_at(move.from_square).piece_type == chess.PAWN:
+            material_gained = 1.0  # en passant
+
     board_copy.push(move)
 
     # Check for immediate checkmate (we got mated)
     if board_copy.is_checkmate():
         return True, 100.0
 
-    # Check if opponent can make a profitable capture (of pieces OTHER than the one we just moved)
+    # Check if opponent can make a profitable capture after our move
+    # Exclude the square we just moved to (that exchange is already evaluated above)
     best_opponent_gain = 0.0
     for opp_move in board_copy.legal_moves:
         if board_copy.is_capture(opp_move):
+            # Skip recaptures on the square we just moved to — already handled
+            if opp_move.to_square == move.to_square:
+                continue
+
             captured_square = opp_move.to_square
             captured_piece = board_copy.piece_at(captured_square)
             if captured_piece is None:
@@ -288,16 +310,20 @@ def is_blunder_move(board: chess.Board, move: chess.Move) -> Tuple[bool, float]:
             if net_gain > best_opponent_gain:
                 best_opponent_gain = net_gain
 
-    # Consider it a blunder if opponent gains material worth >= 2 pawns
-    if best_opponent_gain >= 2.0:
-        return True, best_opponent_gain
+    # Subtract material we gained — winning a queen but losing a knight is net positive
+    effective_loss = best_opponent_gain - material_gained
+
+    # Consider it a blunder only if we're net losing significant material
+    if effective_loss >= 2.0:
+        return True, effective_loss
 
     # Also check if we're leaving high-value pieces undefended
     hanging = get_hanging_pieces(board_copy, our_color)
     if hanging:
         max_hanging = max(hanging.values())
-        if max_hanging >= 3.0:
-            return True, max_hanging
+        # Don't flag if we gained more material than we're risking
+        if max_hanging >= 3.0 and max_hanging > material_gained:
+            return True, max_hanging - material_gained
 
     return False, 0.0
 
@@ -313,7 +339,7 @@ class MCTSConfig:
     temperature_threshold: int = 30   # Move number after which temp -> 0
     add_noise: bool = True            # Add exploration noise at root
     use_material_eval: bool = True    # Use hybrid material evaluation
-    material_weight: float = 0.7      # Weight for material eval (0-1) - high to prevent blunders
+    material_weight: float = 0.2      # Weight for material eval (0-1) - NN should dominate
     blunder_penalty: float = 0.8      # Penalty for blunder moves (reduces prior)
 
 
@@ -666,20 +692,34 @@ class MCTSPlayer:
             if idx < POLICY_OUTPUT_SIZE:
                 move_probs[move] = float(policy_probs[idx])
 
+        # Boost captures of undefended pieces (NN may undervalue tactics)
+        for move in list(move_probs.keys()):
+            if board.is_capture(move):
+                captured = board.piece_at(move.to_square)
+                if captured:
+                    captured_val = PIECE_VALUES.get(captured.piece_type, 0)
+                    attacker = board.piece_at(move.from_square)
+                    attacker_val = PIECE_VALUES.get(attacker.piece_type, 0) if attacker else 0
+                    # Check if captured piece is undefended
+                    opponent = not board.turn
+                    is_defended = board.is_attacked_by(opponent, move.to_square)
+                    if not is_defended and captured_val >= 3.0:
+                        # Free piece: give it a strong prior boost
+                        move_probs[move] = max(move_probs[move], 0.3)
+                    elif is_defended and captured_val > attacker_val + 1.0:
+                        # Winning exchange (e.g., pawn takes queen)
+                        move_probs[move] = max(move_probs[move], 0.2)
+
         # Apply hybrid material evaluation if enabled
         if self.config.use_material_eval:
-            # Calculate material-based value
+            # Calculate material-based value (already from current player's perspective)
             material_value = evaluate_material_safety(board)
 
-            # Adjust for side to move (value is from current player's perspective)
-            if board.turn == chess.BLACK:
-                material_value = -material_value
-
             # Blend neural network value with material evaluation
-            # Use higher material weight when there's significant material imbalance
+            # Only increase material weight in extreme imbalances (e.g. queen up)
             effective_material_weight = self.config.material_weight
-            if abs(material_value) > 0.3:  # Significant material difference (roughly 5+ pawns)
-                effective_material_weight = 0.9  # Trust material almost entirely
+            if abs(material_value) > 0.6:  # Very large imbalance (~9+ pawns)
+                effective_material_weight = min(0.5, effective_material_weight + 0.2)
 
             value = (1 - effective_material_weight) * nn_value + \
                     effective_material_weight * material_value
@@ -766,6 +806,23 @@ class MCTSPlayer:
 
         if temperature is not None:
             self.config.temperature = old_temp
+
+        # Anti-repetition: if best move would cause a draw by repetition,
+        # pick the next best move instead
+        if move and move_probs and not board.is_game_over():
+            test_board = board.copy()
+            test_board.push(move)
+            if test_board.can_claim_draw() or test_board.is_repetition(2):
+                # Try alternatives sorted by visit probability
+                sorted_moves = sorted(move_probs.items(), key=lambda x: -x[1])
+                for alt_move, prob in sorted_moves:
+                    if alt_move == move:
+                        continue
+                    alt_board = board.copy()
+                    alt_board.push(alt_move)
+                    if not alt_board.can_claim_draw() and not alt_board.is_repetition(2):
+                        move = alt_move
+                        break
 
         if return_policy:
             return move, move_probs
