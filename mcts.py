@@ -695,16 +695,36 @@ def _apply_heuristic_boosts(
         board_after = board.copy()
         board_after.push(move)
         if board_after.is_checkmate():
-            # Checkmate — make this overwhelmingly preferred
             move_probs[move] = max(move_probs[move], 0.95)
         elif board_after.is_check():
             move_probs[move] = max(move_probs[move], 0.12)
 
-    # --- 6. Boost piece development in the opening ---
+        # --- 6. Prefer queen promotion over underpromotion ---
+        if move.promotion:
+            if move.promotion == chess.QUEEN:
+                move_probs[move] = max(move_probs[move], 0.5)
+            else:
+                # Underpromotion is almost never better than queen
+                # Only keep it if it's checkmate (already boosted above)
+                if not board_after.is_checkmate():
+                    move_probs[move] *= 0.05
+
+        # --- 7. Penalize passive king moves (Kg8/Kh8 shuffling) ---
+        if piece.piece_type == chess.KING and not board.is_check():
+            # If king moves but doesn't castle, and there are non-king moves available
+            if not board.is_castling(move):
+                non_king_moves = [m for m in board.legal_moves
+                                  if board.piece_at(m.from_square) and
+                                  board.piece_at(m.from_square).piece_type != chess.KING]
+                if len(non_king_moves) > 3:
+                    # Penalize king shuffling when there are plenty of other moves
+                    move_probs[move] *= 0.4
+
+    # --- 8. Boost piece development in the opening ---
     if move_number <= 12:
         move_probs = _boost_development(board, move_probs, our_color)
 
-    # --- 7. King safety: penalize pawn pushes near castled king ---
+    # --- 9. King safety: penalize pawn pushes near castled king ---
     move_probs = _penalize_king_shelter_weakening(board, move_probs, our_color)
 
     return move_probs
