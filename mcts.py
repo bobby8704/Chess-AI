@@ -339,7 +339,7 @@ class MCTSConfig:
     temperature_threshold: int = 30   # Move number after which temp -> 0
     add_noise: bool = True            # Add exploration noise at root
     use_material_eval: bool = True    # Use hybrid material evaluation
-    material_weight: float = 0.2      # Weight for material eval (0-1) - NN should dominate
+    material_weight: float = 0.35     # Weight for material eval - NN value head is weak, material fills the gap
     blunder_penalty: float = 0.8      # Penalty for blunder moves (reduces prior)
 
 
@@ -885,6 +885,12 @@ class MCTSPlayer:
 
         policy_probs = policy_probs.squeeze(0).cpu().numpy()
         nn_value = nn_value.item()
+
+        # Fix White-side bias: the NN value head outputs from White's perspective
+        # (always ~+0.15) instead of the current player's perspective.
+        # Negate for Black so MCTS gets correctly oriented values.
+        if board.turn == chess.BLACK:
+            nn_value = -nn_value
 
         # Convert to move dictionary
         move_probs = {}
