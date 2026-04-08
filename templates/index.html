@@ -5,18 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chess AI</title>
 
-  <!-- chessboard.js CSS -->
-  <link
-    rel="stylesheet"
-    href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css"
-  />
+  <link rel="stylesheet" href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css" />
 
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
       font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-      background: #1a1a2e;
+      background: #0f0f1a;
       color: #e0e0e0;
       min-height: 100vh;
       display: flex;
@@ -27,146 +23,166 @@
     header {
       width: 100%;
       text-align: center;
-      padding: 24px 16px 12px;
+      padding: 20px 16px 8px;
+      background: linear-gradient(180deg, #161625 0%, #0f0f1a 100%);
     }
-    header h1 { font-size: 1.8rem; font-weight: 700; color: #fff; letter-spacing: 0.02em; }
-    header h1 span { color: #4fc3f7; }
-    header p { margin-top: 4px; font-size: 0.9rem; color: #9e9e9e; }
+    header h1 { font-size: 1.7rem; font-weight: 700; color: #fff; letter-spacing: 0.03em; }
+    header h1 .icon { color: #66bb6a; }
+    header p { margin-top: 2px; font-size: 0.85rem; color: #777; }
 
     .game-container {
       display: flex;
       flex-wrap: wrap;
       justify-content: center;
-      gap: 24px;
-      padding: 16px;
+      gap: 20px;
+      padding: 12px 16px;
       max-width: 1020px;
       width: 100%;
     }
 
     /* --- eval bar --- */
-    .eval-col { flex: 0 0 24px; display: flex; flex-direction: column; align-items: center; }
+    .eval-col { flex: 0 0 26px; display: flex; flex-direction: column; align-items: center; }
     .eval-bar-wrap {
-      width: 24px; height: 480px;
-      background: #333;
-      border-radius: 4px;
+      width: 26px; height: 480px;
+      background: #2a2a3a;
+      border-radius: 6px;
       overflow: hidden;
       position: relative;
-      border: 1px solid #444;
+      border: 1px solid #3a3a4a;
     }
     .eval-bar-fill {
       position: absolute; bottom: 0; left: 0; right: 0;
-      background: #e0e0e0;
-      transition: height 0.5s ease;
+      background: linear-gradient(180deg, #e8e8e8 0%, #c0c0c0 100%);
+      transition: height 0.6s ease;
     }
     .eval-label {
       margin-top: 6px;
       font-size: 0.75rem;
-      color: #9e9e9e;
+      color: #888;
       font-family: 'Consolas', monospace;
+      font-weight: 600;
     }
 
     .board-section { flex: 0 0 auto; }
     #board { width: 480px; height: 480px; }
 
-    /* move highlights */
-    .highlight-source { box-shadow: inset 0 0 0 4px rgba(79,195,247,0.75); }
-    .highlight-target { background: radial-gradient(circle, rgba(79,195,247,0.45) 24%, transparent 25%) !important; }
-    .highlight-capture { background: radial-gradient(circle, transparent 52%, rgba(79,195,247,0.45) 53%, rgba(79,195,247,0.45) 64%, transparent 65%) !important; }
-    .highlight-last-from { box-shadow: inset 0 0 0 4px rgba(255,235,59,0.45); }
-    .highlight-last-to { box-shadow: inset 0 0 0 4px rgba(255,235,59,0.45); }
+    /* --- move highlights: GREEN theme --- */
+    .highlight-source {
+      box-shadow: inset 0 0 0 4px rgba(102, 187, 106, 0.8) !important;
+    }
+    .highlight-target {
+      background: radial-gradient(circle, rgba(102, 187, 106, 0.55) 22%, transparent 23%) !important;
+    }
+    .highlight-capture {
+      background: radial-gradient(circle, transparent 50%, rgba(239, 83, 80, 0.55) 51%, rgba(239, 83, 80, 0.55) 63%, transparent 64%) !important;
+    }
+    /* last move: soft amber */
+    .highlight-last-from {
+      background-color: rgba(255, 213, 79, 0.3) !important;
+    }
+    .highlight-last-to {
+      background-color: rgba(255, 213, 79, 0.35) !important;
+    }
+    /* human's just-played move: soft green */
+    .highlight-human-from {
+      background-color: rgba(102, 187, 106, 0.25) !important;
+    }
+    .highlight-human-to {
+      background-color: rgba(102, 187, 106, 0.3) !important;
+    }
 
     .sidebar {
       flex: 1 1 240px;
       max-width: 320px;
       display: flex;
       flex-direction: column;
-      gap: 14px;
+      gap: 12px;
     }
 
-    .status-bar {
-      background: #16213e;
+    /* --- panels --- */
+    .panel {
+      background: #161625;
+      border: 1px solid #252538;
       border-radius: 10px;
       padding: 14px 18px;
-      text-align: center;
     }
-    #status-text { font-size: 1.05rem; font-weight: 600; min-height: 1.4em; }
+
+    /* status */
+    #status-text { font-size: 1.05rem; font-weight: 600; min-height: 1.4em; text-align: center; }
     .status-bar.check   #status-text { color: #ff9800; }
     .status-bar.gameover #status-text { color: #ef5350; }
     .status-bar.playing  #status-text { color: #66bb6a; }
     .status-bar.thinking #status-text { color: #4fc3f7; }
 
-    /* --- AI info row --- */
+    /* AI info */
     .ai-info {
       display: flex;
       justify-content: space-between;
-      background: #16213e;
-      border-radius: 10px;
-      padding: 10px 18px;
-      font-size: 0.85rem;
-      color: #9e9e9e;
+      font-size: 0.82rem;
+      color: #777;
     }
-    .ai-info strong { color: #e0e0e0; }
+    .ai-info strong { color: #ccc; }
 
-    /* --- difficulty picker --- */
-    .difficulty-row {
-      display: flex;
-      gap: 8px;
-    }
+    /* difficulty */
+    .difficulty-row { display: flex; gap: 8px; }
     .diff-btn {
       flex: 1;
-      padding: 9px 0;
-      border: 2px solid #2d2d44;
+      padding: 8px 0;
+      border: 2px solid #252538;
       border-radius: 8px;
       background: transparent;
-      color: #9e9e9e;
-      font-size: 0.85rem;
+      color: #777;
+      font-size: 0.82rem;
       font-weight: 600;
       cursor: pointer;
       transition: all 0.15s;
     }
-    .diff-btn:hover { border-color: #4fc3f7; color: #e0e0e0; }
-    .diff-btn.active { border-color: #4fc3f7; background: rgba(79,195,247,0.15); color: #4fc3f7; }
+    .diff-btn:hover { border-color: #66bb6a; color: #ccc; }
+    .diff-btn.active { border-color: #66bb6a; background: rgba(102,187,106,0.12); color: #66bb6a; }
 
     .actions { display: flex; gap: 10px; }
     .btn {
-      flex: 1; padding: 12px 0; border: none; border-radius: 8px;
-      font-size: 0.95rem; font-weight: 600; cursor: pointer;
+      flex: 1; padding: 11px 0; border: none; border-radius: 8px;
+      font-size: 0.9rem; font-weight: 600; cursor: pointer;
       transition: background 0.15s, transform 0.1s;
     }
     .btn:active { transform: scale(0.97); }
-    .btn-primary { background: #4fc3f7; color: #1a1a2e; }
-    .btn-primary:hover { background: #81d4fa; }
+    .btn-primary { background: #66bb6a; color: #0f0f1a; }
+    .btn-primary:hover { background: #81c784; }
 
+    /* move list */
     .move-list-container {
-      background: #16213e;
-      border-radius: 10px;
-      padding: 14px 18px;
       flex: 1;
       display: flex;
       flex-direction: column;
-      min-height: 180px;
-      max-height: 340px;
+      min-height: 160px;
+      max-height: 320px;
     }
     .move-list-container h3 {
-      font-size: 0.8rem;
+      font-size: 0.75rem;
       text-transform: uppercase;
       letter-spacing: 0.08em;
-      color: #9e9e9e;
+      color: #666;
       margin-bottom: 8px;
     }
     #move-list {
       flex: 1; overflow-y: auto;
       font-family: 'Consolas', 'Courier New', monospace;
-      font-size: 0.85rem; line-height: 1.7;
+      font-size: 0.82rem; line-height: 1.8;
     }
-    .move-row { display: flex; gap: 8px; }
-    .move-num { color: #616161; min-width: 30px; text-align: right; }
-    .move-white { color: #fff; min-width: 60px; }
-    .move-black { color: #b0bec5; min-width: 60px; }
+    #move-list::-webkit-scrollbar { width: 4px; }
+    #move-list::-webkit-scrollbar-track { background: transparent; }
+    #move-list::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+    .move-row { display: flex; gap: 6px; padding: 0 2px; border-radius: 3px; }
+    .move-row:hover { background: rgba(255,255,255,0.03); }
+    .move-row.latest { background: rgba(102,187,106,0.08); }
+    .move-num { color: #555; min-width: 28px; text-align: right; }
+    .move-white { color: #e0e0e0; min-width: 56px; }
+    .move-black { color: #999; min-width: 56px; }
 
     .spinner {
-      display: inline-block; width: 18px; height: 18px;
-      border: 3px solid rgba(79,195,247,0.3); border-top-color: #4fc3f7;
+      display: inline-block; width: 16px; height: 16px;
+      border: 2.5px solid rgba(102,187,106,0.3); border-top-color: #66bb6a;
       border-radius: 50%; animation: spin 0.8s linear infinite;
       vertical-align: middle; margin-right: 8px;
     }
@@ -176,24 +192,24 @@
       #board { width: 88vw; height: 88vw; }
       .eval-bar-wrap { height: 88vw; }
       .sidebar { max-width: 92vw; }
-      header h1 { font-size: 1.4rem; }
+      header h1 { font-size: 1.3rem; }
     }
 
     footer {
-      margin-top: auto; padding: 20px;
-      text-align: center; font-size: 0.8rem; color: #616161;
+      margin-top: auto; padding: 16px;
+      text-align: center; font-size: 0.75rem; color: #444;
     }
+    footer a { color: #66bb6a; text-decoration: none; }
   </style>
 </head>
 
 <body>
   <header>
-    <h1><span>&#9816;</span> Chess AI</h1>
+    <h1><span class="icon">&#9816;</span> Chess AI</h1>
     <p>You play White &mdash; neural-network MCTS plays Black</p>
   </header>
 
   <div class="game-container">
-    <!-- Eval bar -->
     <div class="eval-col">
       <div class="eval-bar-wrap">
         <div class="eval-bar-fill" id="eval-fill" style="height:50%"></div>
@@ -201,18 +217,16 @@
       <div class="eval-label" id="eval-label">0.0</div>
     </div>
 
-    <!-- Board -->
     <div class="board-section">
       <div id="board"></div>
     </div>
 
-    <!-- Sidebar -->
     <div class="sidebar">
-      <div class="status-bar playing" id="status-bar">
+      <div class="panel status-bar playing" id="status-bar">
         <div id="status-text">Click "New Game" to start</div>
       </div>
 
-      <div class="ai-info">
+      <div class="panel ai-info">
         <div>Think time: <strong id="think-time">-</strong></div>
         <div>Move: <strong id="move-num">-</strong></div>
       </div>
@@ -227,7 +241,7 @@
         <button class="btn btn-primary" id="btn-new" onclick="newGame()">New Game</button>
       </div>
 
-      <div class="move-list-container">
+      <div class="panel move-list-container">
         <h3>Moves</h3>
         <div id="move-list"></div>
       </div>
@@ -235,7 +249,7 @@
   </div>
 
   <footer>
-    Powered by MCTS + dual neural network &middot; Built with chessboard.js
+    Powered by MCTS + dual neural network
   </footer>
 
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
@@ -248,7 +262,9 @@
     let board = null;
     let thinking = false;
     let lastMove = null;
+    let humanMove = null;
     let currentDifficulty = 'hard';
+    let moveHistory = [];  // local copy for instant rendering
 
     const boardConfig = {
       draggable: true,
@@ -269,8 +285,6 @@
 
     // ========== Eval bar ==========
     function updateEval(evaluation) {
-      // evaluation is -1 to +1 from White's perspective
-      // Convert to percentage (0.5 = even, 1.0 = white winning fully)
       const pct = Math.max(2, Math.min(98, 50 + evaluation * 50));
       document.getElementById('eval-fill').style.height = pct + '%';
       const sign = evaluation >= 0 ? '+' : '';
@@ -280,13 +294,18 @@
     // ========== Highlighting ==========
     function clearHighlights() {
       $('#board .square-55d63').removeClass(
-        'highlight-source highlight-target highlight-capture highlight-last-from highlight-last-to'
+        'highlight-source highlight-target highlight-capture highlight-last-from highlight-last-to highlight-human-from highlight-human-to'
       );
     }
     function showLastMove() {
       if (!lastMove) return;
       $('#board .square-' + lastMove.from).addClass('highlight-last-from');
       $('#board .square-' + lastMove.to).addClass('highlight-last-to');
+    }
+    function showHumanMove() {
+      if (!humanMove) return;
+      $('#board .square-' + humanMove.from).addClass('highlight-human-from');
+      $('#board .square-' + humanMove.to).addClass('highlight-human-to');
     }
     function highlightLegalMoves(square) {
       const moves = game.moves({ square, verbose: true });
@@ -304,16 +323,36 @@
       clearHighlights();
       highlightLegalMoves(source);
     }
+
     function onDrop(source, target) {
       clearHighlights();
       const moveObj = game.move({ from: source, to: target, promotion: 'q' });
       if (moveObj === null) return 'snapback';
-      game.undo();
+
+      // Show the human move IMMEDIATELY on the board
+      const san = moveObj.san;
+      humanMove = { from: source, to: target };
+      board.position(game.fen());
+      clearHighlights();
+      showHumanMove();
+
+      // Add to local history and render immediately
+      moveHistory.push({ color: 'white', san: san, uci: source + target });
+      renderMoves(moveHistory);
+
+      // Build UCI string
       let uci = source + target;
       if (moveObj.flags.includes('p')) uci += 'q';
+
+      // Now undo the local move — server is authoritative
+      game.undo();
+
+      // Send to server (AI will respond)
       sendMove(uci);
     }
+
     function onSnapEnd() { board.position(game.fen()); }
+
     function onMouseoverSquare(square, piece) {
       if (thinking || game.game_over() || game.turn() !== 'w') return;
       if (!piece || piece.search(/^b/) !== -1) return;
@@ -325,6 +364,8 @@
     async function newGame() {
       thinking = false;
       lastMove = null;
+      humanMove = null;
+      moveHistory = [];
       setStatus('Starting new game...', 'thinking');
       updateEval(0);
       document.getElementById('think-time').textContent = '-';
@@ -351,7 +392,6 @@
     async function sendMove(uci) {
       if (!gameId) return;
       thinking = true;
-      clearHighlights();
       setStatus('<span class="spinner"></span>AI is thinking...', 'thinking');
 
       try {
@@ -364,25 +404,33 @@
 
         if (data.error) { setStatus(data.error, 'gameover'); thinking = false; return; }
 
+        // Sync state from server (authoritative)
         game = new Chess(data.fen);
-        board.position(data.fen, true);
+        board.position(data.fen, true);  // animate AI's move
+        moveHistory = data.history || [];
 
-        // Eval bar
         if (data.evaluation !== undefined) updateEval(data.evaluation);
 
-        // AI info
         if (data.ai_time_ms) {
-          const sec = (data.ai_time_ms / 1000).toFixed(1);
-          document.getElementById('think-time').textContent = sec + 's';
+          document.getElementById('think-time').textContent = (data.ai_time_ms / 1000).toFixed(1) + 's';
         }
         document.getElementById('move-num').textContent = data.move_number || '-';
 
-        // Last move highlight
+        // Highlight AI's last move
+        humanMove = null;
         if (data.history && data.history.length >= 2) {
           const aiMove = data.history[data.history.length - 1];
           if (aiMove && aiMove.uci) {
             lastMove = { from: aiMove.uci.substring(0,2), to: aiMove.uci.substring(2,4) };
             setTimeout(() => { clearHighlights(); showLastMove(); }, 300);
+          }
+        } else if (data.history && data.history.length === 1) {
+          // Game ended after human move (no AI reply)
+          lastMove = null;
+          const hm = data.history[0];
+          if (hm && hm.uci) {
+            humanMove = { from: hm.uci.substring(0,2), to: hm.uci.substring(2,4) };
+            setTimeout(() => { clearHighlights(); showHumanMove(); }, 300);
           }
         }
 
@@ -403,21 +451,25 @@
 
     // ========== UI helpers ==========
     function setStatus(html, cls) {
-      document.getElementById('status-bar').className = 'status-bar ' + cls;
+      document.getElementById('status-bar').className = 'panel status-bar ' + cls;
       document.getElementById('status-text').innerHTML = html;
     }
+
     function renderMoves(history) {
       const el = document.getElementById('move-list');
       let html = '';
+      const totalRows = Math.ceil(history.length / 2);
       for (let i = 0; i < history.length; i += 2) {
         const num = Math.floor(i/2) + 1;
         const w = history[i] ? history[i].san : '';
         const b = history[i+1] ? history[i+1].san : '';
-        html += `<div class="move-row"><span class="move-num">${num}.</span><span class="move-white">${w}</span><span class="move-black">${b}</span></div>`;
+        const isLatest = (num === totalRows);
+        html += `<div class="move-row${isLatest ? ' latest' : ''}"><span class="move-num">${num}.</span><span class="move-white">${w}</span><span class="move-black">${b}</span></div>`;
       }
       el.innerHTML = html;
       el.scrollTop = el.scrollHeight;
     }
+
     function capitalise(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 
     newGame();
