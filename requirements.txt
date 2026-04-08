@@ -1,0 +1,13 @@
+# Core Dependencies
+python-chess>=1.11.2
+torch>=2.0.0
+numpy>=1.24.0
+pygame-ce>=2.5.0
+
+# Web Server
+flask>=3.0.0
+
+# Utilities
+click>=8.1.0
+colorama>=0.4.6
+filelock>=3.12.0
