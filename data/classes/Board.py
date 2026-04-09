@@ -29,6 +29,7 @@ class Board:
             ['wR', 'wN', 'wB', 'wQ', 'wK', 'wB', 'wN', 'wR'],
         ]
         self.squares = self.generate_squares()
+        self._square_map = {(s.x, s.y): s for s in self.squares}
         self.setup_board()
 
     def generate_squares(self):
@@ -41,9 +42,7 @@ class Board:
         return output
 
     def get_square_from_pos(self, pos):
-        for square in self.squares:
-            if (square.x, square.y) == (pos[0], pos[1]):
-                return square
+        return self._square_map.get((pos[0], pos[1]))
 
     def get_piece_from_pos(self, pos):
         return self.get_square_from_pos(pos).occupying_piece

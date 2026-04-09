@@ -7,7 +7,6 @@ Uses the MCTS engine with the trained dual neural network.
 
 import uuid
 import time
-import os
 import chess
 from flask import Flask, jsonify, request, render_template, send_from_directory
 
@@ -40,17 +39,13 @@ except Exception as e:
 
 
 def _make_player(num_sims: int) -> MCTSPlayer:
-    """Create an MCTS player with the given simulation count."""
+    """Create a fresh MCTS player (new search tree each time to avoid memory bloat)."""
     config = MCTSConfig(
         num_simulations=num_sims,
         temperature=0,
         add_noise=False,
     )
     return MCTSPlayer(model=dual_model, config=config)
-
-
-# Pre-create players for each difficulty
-players = {name: _make_player(sims) for name, sims in DIFFICULTY_PRESETS.items()}
 
 # ---------------------------------------------------------------------------
 # In-memory game sessions
@@ -199,9 +194,10 @@ def make_move():
         _archive_game(game_id, board)
         return jsonify(board_to_json(board, game_id))
 
-    # --- AI reply ---
+    # --- AI reply (fresh player per move to avoid memory bloat from stale trees) ---
     difficulty = game_difficulty.get(game_id, "hard")
-    player = players.get(difficulty, players["hard"])
+    num_sims = DIFFICULTY_PRESETS.get(difficulty, 300)
+    player = _make_player(num_sims)
 
     start = time.time()
     ai_move = player.select_move(board)

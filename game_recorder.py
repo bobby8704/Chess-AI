@@ -600,7 +600,8 @@ class GameRecorder:
             params.append(result.value)
 
         if limit:
-            query += f" LIMIT {limit}"
+            query += " LIMIT ?"
+            params.append(limit)
 
         cursor.execute(query, params)
         rows = cursor.fetchall()
@@ -781,7 +782,8 @@ class GameRecorder:
             params.extend([player_type.value, player_type.value])
 
         if limit:
-            query += f" LIMIT {limit}"
+            query += " LIMIT ?"
+            params.append(limit)
 
         cursor.execute(query, params)
         rows = cursor.fetchall()
