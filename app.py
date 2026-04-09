@@ -194,6 +194,25 @@ def make_move():
         _archive_game(game_id, board)
         return jsonify(board_to_json(board, game_id))
 
+    # --- Check if AI should resign (hopelessly behind) ---
+    from mcts import calculate_material
+    material = calculate_material(board)
+    # material is from White's perspective; AI is Black, so negative = AI losing
+    ai_material_deficit = material  # positive means White (human) is ahead
+    if ai_material_deficit >= 15.0 and board.fullmove_number >= 20:
+        # AI is down 15+ pawns worth (e.g., 2 queens) after move 20 — resign
+        game_histories[game_id].append({
+            "color": "black",
+            "san": "resigns",
+            "uci": "",
+        })
+        resp = board_to_json(board, game_id)
+        resp["is_game_over"] = True
+        resp["status"] = "Black resigns — White wins"
+        resp["result"] = "1-0"
+        _archive_game(game_id, board)
+        return jsonify(resp)
+
     # --- AI reply (fresh player per move to avoid memory bloat from stale trees) ---
     difficulty = game_difficulty.get(game_id, "hard")
     num_sims = DIFFICULTY_PRESETS.get(difficulty, 300)

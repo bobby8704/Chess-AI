@@ -815,11 +815,8 @@ class MCTSPlayer:
         policy_probs = policy_probs.squeeze(0).cpu().numpy()
         nn_value = nn_value.item()
 
-        # Fix White-side bias: the NN value head outputs from White's perspective
-        # (always ~+0.15) instead of the current player's perspective.
-        # Negate for Black so MCTS gets correctly oriented values.
-        if board.turn == chess.BLACK:
-            nn_value = -nn_value
+        # Note: NN value head is trained to output from the current player's
+        # perspective (positive = good for side to move). No perspective flip needed.
 
         # Convert to move dictionary
         move_probs = {}

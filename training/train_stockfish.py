@@ -40,6 +40,12 @@ print("STARTUP: All imports complete", flush=True)
 
 sys.stdout.reconfigure(line_buffering=True)
 
+# Ensure project root is on the path (so imports work when run from any directory)
+SCRIPT_DIR_FOR_IMPORTS = Path(__file__).parent.absolute()
+PROJECT_ROOT = SCRIPT_DIR_FOR_IMPORTS.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from neural_network import DualNet, POLICY_OUTPUT_SIZE, encode_move, get_legal_move_mask
 from features import board_to_tensor
 
@@ -49,15 +55,15 @@ from features import board_to_tensor
 SCRIPT_DIR = Path(__file__).parent.absolute()
 PROJECT_DIR = SCRIPT_DIR.parent
 STOCKFISH_PATH = str(PROJECT_DIR / "stockfish" / "stockfish.exe")
-STOCKFISH_DEPTH = 10  # Depth for analysis (higher = stronger but slower)
-STOCKFISH_TIME_LIMIT = 0.1  # Time limit per move in seconds
+STOCKFISH_DEPTH = 12  # Depth for analysis (higher = stronger but slower)
+STOCKFISH_TIME_LIMIT = 0.15  # Time limit per move in seconds
 
 # Training settings
 BATCH_SIZE = 128
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0005
 GAMES_PER_ITER = 5
 MAX_GAME_MOVES = 100
-TRAIN_EPOCHS = 3
+TRAIN_EPOCHS = 5
 
 # Difficulty progression
 # Start with intermediate Stockfish since model already plays well
@@ -66,8 +72,8 @@ FINAL_ELO = 2000  # Target strength (strong club player)
 ELO_INCREASE_INTERVAL = 15  # Increase ELO every N iterations
 
 # Checkpoint settings
-CHECKPOINT_INTERVAL = 5
-AUTO_SAVE_INTERVAL = 3
+CHECKPOINT_INTERVAL = 25
+AUTO_SAVE_INTERVAL = 5
 LOG_FILE = "data/training/stockfish_training_log.txt"
 
 # ==================== Utilities ====================
@@ -289,10 +295,27 @@ def generate_training_game(model, stockfish, device, model_plays_white=True):
     return training_data, result, move_count
 
 
-def generate_imitation_data(stockfish, num_positions=100):
+_COMMON_OPENINGS = [
+    # Sicilian, French, Caro-Kann, Italian, Ruy Lopez, Queen's Gambit, etc.
+    "e2e4 e7e5", "e2e4 c7c5", "e2e4 e7e6", "e2e4 c7c6", "e2e4 d7d5",
+    "d2d4 d7d5", "d2d4 g8f6", "d2d4 d7d5 c2c4", "d2d4 d7d5 c2c4 e7e6",
+    "e2e4 e7e5 g1f3 b8c6", "e2e4 e7e5 g1f3 b8c6 f1c4",
+    "e2e4 e7e5 g1f3 b8c6 f1b5", "d2d4 d7d5 c2c4 c7c6",
+    "e2e4 c7c5 g1f3 d7d6", "e2e4 c7c5 g1f3 b8c6",
+    "d2d4 g8f6 c2c4 g7g6", "c2c4 e7e5", "g1f3 d7d5",
+    "e2e4 e7e5 g1f3 g8f6", "d2d4 d7d5 g1f3 g8f6",
+    "",  # starting position (no opening moves)
+]
+
+def generate_imitation_data(stockfish, num_positions=200):
     """
     Generate training data by having Stockfish play itself.
     Model learns to imitate Stockfish's moves.
+
+    Value target is from the CURRENT PLAYER's perspective:
+    - Positive = good for side to move
+    - Negative = bad for side to move
+    This ensures the NN learns perspective-correct evaluation.
     """
     training_data = []
 
@@ -300,14 +323,23 @@ def generate_imitation_data(stockfish, num_positions=100):
         board = chess.Board()
         move_count = 0
 
-        # Play a random opening to get varied positions
-        opening_moves = random.randint(4, 10)
-        for _ in range(opening_moves):
-            if board.is_game_over():
-                break
-            legal = list(board.legal_moves)
-            if legal:
-                board.push(random.choice(legal))
+        # Use real openings for realistic positions (with some randomization)
+        if random.random() < 0.7:
+            opening = random.choice(_COMMON_OPENINGS)
+            for uci in opening.split():
+                if uci:
+                    try:
+                        board.push_uci(uci)
+                    except ValueError:
+                        break
+        else:
+            # 30% random openings for variety
+            for _ in range(random.randint(4, 10)):
+                if board.is_game_over():
+                    break
+                legal = list(board.legal_moves)
+                if legal:
+                    board.push(random.choice(legal))
 
         # Now collect Stockfish moves
         while not board.is_game_over() and move_count < 40:
@@ -321,10 +353,12 @@ def generate_imitation_data(stockfish, num_positions=100):
             policy_target = np.zeros(POLICY_OUTPUT_SIZE, dtype=np.float32)
             policy_target[encode_move(sf_move)] = 1.0
 
+            # Stockfish eval is from White's perspective (positive = White better)
+            # Convert to CURRENT PLAYER's perspective for training
             eval_score = stockfish.evaluate_position(board)
+            # eval_score is already relative (from side-to-move's perspective
+            # in python-chess's engine analysis), so just normalize
             value_target = np.tanh(eval_score / 4.0)
-            if board.turn == chess.BLACK:
-                value_target = -value_target
 
             training_data.append((tensor, policy_target, value_target))
 
@@ -449,7 +483,7 @@ def run_training(hours, model_path, mode="imitation"):
 
             if mode == "imitation":
                 # Pure imitation learning from Stockfish self-play
-                training_data = generate_imitation_data(stockfish, num_positions=100)
+                training_data = generate_imitation_data(stockfish, num_positions=200)
             else:
                 # Play & Learn mode
                 for game_num in range(GAMES_PER_ITER):
@@ -536,7 +570,7 @@ def run_training(hours, model_path, mode="imitation"):
 def main():
     parser = argparse.ArgumentParser(description="Stockfish Teacher Training")
     parser.add_argument("--hours", type=float, default=2.0, help="Training duration")
-    parser.add_argument("--model", type=str, default="dual_model_mcts.pt", help="Model path")
+    parser.add_argument("--model", type=str, default="models/dual_model_mcts.pt", help="Model path")
     parser.add_argument("--mode", type=str, default="imitation",
                         choices=["imitation", "play"],
                         help="Training mode: 'imitation' or 'play'")
