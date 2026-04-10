@@ -11,7 +11,8 @@ import chess
 from flask import Flask, jsonify, request, render_template, send_from_directory
 
 from neural_network import load_dual_model
-from mcts import MCTSPlayer, MCTSConfig, evaluate_material_safety
+from mcts import MCTSPlayer, MCTSConfig
+from evaluation import evaluate as hc_evaluate
 
 # ---------------------------------------------------------------------------
 # App & AI initialisation
@@ -59,10 +60,8 @@ completed_games: list[dict] = []  # Archive of finished games
 
 def _get_evaluation(board: chess.Board) -> float:
     """Get position evaluation from White's perspective (-1 to +1)."""
-    if dual_model is None:
-        return 0.0
-    val = evaluate_material_safety(board)
-    # evaluate_material_safety returns from current player's perspective
+    val = hc_evaluate(board)
+    # hc_evaluate returns from current player's perspective
     # Convert to White's perspective for the UI
     if board.turn == chess.BLACK:
         val = -val

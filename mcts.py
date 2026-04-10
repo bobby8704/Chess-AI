@@ -828,67 +828,41 @@ class MCTSPlayer:
         # === Heuristic policy adjustments (compensate for NN weaknesses) ===
         move_probs = _apply_heuristic_boosts(board, move_probs)
 
-        # Apply hybrid material evaluation if enabled
-        if self.config.use_material_eval:
-            # Calculate material-based value (already from current player's perspective)
-            material_value = evaluate_material_safety(board)
+        # === Position value: use hand-coded eval (much stronger than NN value head) ===
+        from evaluation import evaluate as hc_evaluate
+        value = hc_evaluate(board)
 
-            # Blend neural network value with material evaluation
-            # Only increase material weight in extreme imbalances (e.g. queen up)
-            effective_material_weight = self.config.material_weight
-            if abs(material_value) > 0.6:  # Very large imbalance (~9+ pawns)
-                effective_material_weight = min(0.5, effective_material_weight + 0.2)
+        # Analyze all moves for blunders and penalize them in policy
+        blunder_moves = {}
+        safe_moves = {}
+        for move, prob in move_probs.items():
+            is_blunder, material_lost = is_blunder_move(board, move)
+            if is_blunder:
+                blunder_moves[move] = (prob, material_lost)
+            else:
+                safe_moves[move] = prob
 
-            value = (1 - effective_material_weight) * nn_value + \
-                    effective_material_weight * material_value
-
-            # Analyze all moves for blunders
-            blunder_moves = {}
-            safe_moves = {}
-            for move, prob in move_probs.items():
-                is_blunder, material_lost = is_blunder_move(board, move)
-                if is_blunder:
-                    blunder_moves[move] = (prob, material_lost)
-                else:
-                    safe_moves[move] = prob
-
-            # If there are safe moves, heavily penalize blunders
-            if safe_moves:
-                adjusted_probs = {}
-
-                # Calculate total safe probability
-                total_safe_prob = sum(safe_moves.values())
-
-                # ALWAYS boost safe moves and crush blunders
-                # This ensures MCTS strongly prefers safe moves
-                if total_safe_prob > 0:
-                    # Normalize safe moves to take 99% of probability
-                    for move, prob in safe_moves.items():
-                        adjusted_probs[move] = (prob / total_safe_prob) * 0.99
-
-                    # Blunders get only 1% total, distributed by inverse severity
-                    for move, (prob, material_lost) in blunder_moves.items():
-                        # Worse blunders get less probability
-                        inverse_severity = max(0.1, 1.0 - material_lost / 10.0)
-                        adjusted_probs[move] = 0.01 * inverse_severity / max(len(blunder_moves), 1)
-                else:
-                    # Shouldn't happen, but fallback
-                    for move, prob in safe_moves.items():
-                        adjusted_probs[move] = prob
-                    for move, (prob, _) in blunder_moves.items():
-                        adjusted_probs[move] = prob * 0.01
-
-                move_probs = adjusted_probs
-            # If ALL moves are blunders, pick the least bad one
-            elif blunder_moves:
-                adjusted_probs = {}
+        if safe_moves:
+            adjusted_probs = {}
+            total_safe_prob = sum(safe_moves.values())
+            if total_safe_prob > 0:
+                for move, prob in safe_moves.items():
+                    adjusted_probs[move] = (prob / total_safe_prob) * 0.99
                 for move, (prob, material_lost) in blunder_moves.items():
-                    # Invert: moves with less material loss get higher weight
-                    inverse_loss = 10.0 - material_lost
-                    adjusted_probs[move] = prob * inverse_loss
-                move_probs = adjusted_probs
-        else:
-            value = nn_value
+                    inverse_severity = max(0.1, 1.0 - material_lost / 10.0)
+                    adjusted_probs[move] = 0.01 * inverse_severity / max(len(blunder_moves), 1)
+            else:
+                for move, prob in safe_moves.items():
+                    adjusted_probs[move] = prob
+                for move, (prob, _) in blunder_moves.items():
+                    adjusted_probs[move] = prob * 0.01
+            move_probs = adjusted_probs
+        elif blunder_moves:
+            adjusted_probs = {}
+            for move, (prob, material_lost) in blunder_moves.items():
+                inverse_loss = 10.0 - material_lost
+                adjusted_probs[move] = prob * inverse_loss
+            move_probs = adjusted_probs
 
         # Normalize
         total = sum(move_probs.values())

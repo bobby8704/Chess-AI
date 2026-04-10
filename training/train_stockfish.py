@@ -406,7 +406,9 @@ def train_epoch(model, optimizer, training_data, device):
         # Value loss (MSE with Stockfish's evaluation)
         value_loss = torch.mean((value_pred.squeeze() - value_batch) ** 2)
 
-        loss = policy_loss + value_loss
+        # Weight value loss 10x so the value head gets proper gradient signal
+        # (policy loss ~5.0 vs value loss ~0.05 — without weighting, value head starves)
+        loss = policy_loss + 10.0 * value_loss
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
