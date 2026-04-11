@@ -997,8 +997,13 @@ class MCTSPlayer:
                 return {}, 0.0
             return {m: 1.0 / len(legal_moves) for m in legal_moves}, 0.0
 
-        # Convert to tensor
-        x = torch.from_numpy(board_to_tensor(board)).float().to(self.device).unsqueeze(0)
+        # Convert to tensor (2D for CNN, flat for MLP)
+        from neural_network import is_cnn_model
+        if is_cnn_model(self.model):
+            from features import board_to_tensor_2d
+            x = torch.from_numpy(board_to_tensor_2d(board)).float().to(self.device).unsqueeze(0)
+        else:
+            x = torch.from_numpy(board_to_tensor(board)).float().to(self.device).unsqueeze(0)
         mask = get_legal_move_mask(board).to(self.device).unsqueeze(0)
 
         with torch.no_grad():

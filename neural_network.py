@@ -329,31 +329,144 @@ class DualNetResidual(nn.Module):
         return policy_probs, value
 
 
+# ==================== CNN Architecture ====================
+
+class ConvResBlock(nn.Module):
+    """Convolutional residual block: Conv -> BN -> ReLU -> Conv -> BN + skip."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return F.relu(out + residual)
+
+
+class DualNetCNN(nn.Module):
+    """
+    CNN with residual blocks for chess (AlphaZero-style).
+
+    Input: (batch, 13, 8, 8) — 12 piece planes + 1 auxiliary plane
+    Output: policy logits (4288) + value scalar
+
+    Architecture:
+        Input conv (13 -> filters) -> N residual blocks -> policy head + value head
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 13,
+        num_filters: int = 128,
+        num_res_blocks: int = 6,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.num_filters = num_filters
+        self.num_res_blocks = num_res_blocks
+
+        # Input convolution
+        self.input_conv = nn.Sequential(
+            nn.Conv2d(in_channels, num_filters, 3, padding=1, bias=False),
+            nn.BatchNorm2d(num_filters),
+            nn.ReLU(),
+        )
+
+        # Residual tower
+        self.res_tower = nn.Sequential(
+            *[ConvResBlock(num_filters) for _ in range(num_res_blocks)]
+        )
+
+        # Policy head: conv 1x1 -> flatten -> FC -> 4288
+        self.policy_conv = nn.Sequential(
+            nn.Conv2d(num_filters, 32, 1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+        )
+        self.policy_fc = nn.Linear(32 * 64, POLICY_OUTPUT_SIZE)
+
+        # Value head: conv 1x1 -> flatten -> FC -> FC -> tanh
+        self.value_conv = nn.Sequential(
+            nn.Conv2d(num_filters, 1, 1, bias=False),
+            nn.BatchNorm2d(1),
+            nn.ReLU(),
+        )
+        self.value_fc = nn.Sequential(
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+            nn.Tanh(),
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # x: (batch, 13, 8, 8)
+        features = self.input_conv(x)
+        features = self.res_tower(features)
+
+        # Policy
+        p = self.policy_conv(features)
+        p = p.view(p.size(0), -1)  # flatten
+        policy = self.policy_fc(p)
+
+        # Value
+        v = self.value_conv(features)
+        v = v.view(v.size(0), -1)  # flatten
+        value = self.value_fc(v)
+
+        return policy, value
+
+    def get_policy_value(
+        self,
+        x: torch.Tensor,
+        legal_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        policy_logits, value = self.forward(x)
+        masked_logits = policy_logits.masked_fill(legal_mask == 0, float('-inf'))
+        policy_probs = F.softmax(masked_logits, dim=-1)
+        return policy_probs, value
+
+
 # ==================== Model Loading Utilities ====================
 
 _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _dual_model: Optional[DualNet] = None
 
 
-def load_dual_model(path: str) -> DualNet:
-    """Load a trained dual network from disk."""
+def load_dual_model(path: str):
+    """Load a trained dual network from disk. Supports DualNet, DualNetResidual, and DualNetCNN."""
     global _dual_model
     ckpt = torch.load(path, map_location=_device, weights_only=False)
 
-    input_dim = ckpt.get("input_dim", 781)
     model_type = ckpt.get("model_type", "DualNet")
 
-    if model_type == "DualNetResidual":
+    if model_type == "DualNetCNN":
+        in_channels = ckpt.get("in_channels", 13)
+        num_filters = ckpt.get("num_filters", 128)
+        num_res_blocks = ckpt.get("num_res_blocks", 6)
+        _dual_model = DualNetCNN(in_channels, num_filters, num_res_blocks).to(_device)
+    elif model_type == "DualNetResidual":
+        input_dim = ckpt.get("input_dim", 781)
         hidden_dim = ckpt.get("hidden_dim", 512)
         num_blocks = ckpt.get("num_residual_blocks", 4)
         _dual_model = DualNetResidual(input_dim, hidden_dim, num_blocks).to(_device)
     else:
+        input_dim = ckpt.get("input_dim", 781)
         hidden_dim = ckpt.get("hidden_dim", 512)
         _dual_model = DualNet(input_dim, hidden_dim).to(_device)
 
     _dual_model.load_state_dict(ckpt["state_dict"])
     _dual_model.eval()
     return _dual_model
+
+
+def is_cnn_model(model) -> bool:
+    """Check if the loaded model is a CNN (needs 2D input)."""
+    return isinstance(model, DualNetCNN)
 
 
 def get_dual_model() -> Optional[DualNet]:

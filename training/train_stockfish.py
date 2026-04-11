@@ -46,8 +46,8 @@ PROJECT_ROOT = SCRIPT_DIR_FOR_IMPORTS.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from neural_network import DualNet, POLICY_OUTPUT_SIZE, encode_move, get_legal_move_mask
-from features import board_to_tensor
+from neural_network import DualNet, DualNetCNN, POLICY_OUTPUT_SIZE, encode_move, get_legal_move_mask
+from features import board_to_tensor, board_to_tensor_2d
 
 # ==================== Configuration ====================
 
@@ -70,6 +70,9 @@ TRAIN_EPOCHS = 5
 INITIAL_ELO = 1400  # Starting strength (intermediate - model already beats casual players)
 FINAL_ELO = 2000  # Target strength (strong club player)
 ELO_INCREASE_INTERVAL = 15  # Increase ELO every N iterations
+
+# Architecture (set by CLI arg)
+USE_CNN = True  # True = DualNetCNN, False = DualNet MLP
 
 # Checkpoint settings
 CHECKPOINT_INTERVAL = 25
@@ -191,33 +194,54 @@ class StockfishTeacher:
 
 # ==================== Neural Network ====================
 
-def load_or_create_model(model_path, device):
+def load_or_create_model(model_path, device, architecture="cnn"):
     """Load existing model or create new one."""
-    model = DualNet(input_dim=781).to(device)
+    if architecture == "cnn":
+        model = DualNetCNN(in_channels=13, num_filters=128, num_res_blocks=6).to(device)
+    else:
+        model = DualNet(input_dim=781).to(device)
 
     if os.path.exists(model_path):
         try:
             checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-                model.load_state_dict(checkpoint["state_dict"])
+            model_type = checkpoint.get("model_type", "DualNet") if isinstance(checkpoint, dict) else "DualNet"
+
+            # Only load weights if architecture matches
+            if (architecture == "cnn" and model_type == "DualNetCNN") or \
+               (architecture != "cnn" and model_type != "DualNetCNN"):
+                if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                    model.load_state_dict(checkpoint["state_dict"])
+                else:
+                    model.load_state_dict(checkpoint)
+                log(f"Loaded existing model: {model_path} ({model_type})")
             else:
-                model.load_state_dict(checkpoint)
-            log(f"Loaded existing model: {model_path}")
+                log(f"Architecture mismatch ({model_type} vs {architecture}), starting fresh CNN")
         except Exception as e:
             log(f"Could not load model, starting fresh: {e}")
     else:
-        log("No existing model found, starting fresh")
+        log(f"No existing model found, creating fresh {architecture}")
 
     return model
 
 
 def save_model(model, path):
     """Save model with metadata."""
-    torch.save({
-        "input_dim": 781,
-        "state_dict": model.state_dict(),
-        "timestamp": datetime.now().isoformat()
-    }, path)
+    if isinstance(model, DualNetCNN):
+        torch.save({
+            "model_type": "DualNetCNN",
+            "in_channels": model.in_channels,
+            "num_filters": model.num_filters,
+            "num_res_blocks": model.num_res_blocks,
+            "state_dict": model.state_dict(),
+            "timestamp": datetime.now().isoformat()
+        }, path)
+    else:
+        torch.save({
+            "input_dim": 781,
+            "model_type": "DualNet",
+            "state_dict": model.state_dict(),
+            "timestamp": datetime.now().isoformat()
+        }, path)
 
 
 # ==================== Training Data Generation ====================
@@ -239,7 +263,7 @@ def generate_training_game(model, stockfish, device, model_plays_white=True):
         if is_model_turn:
             # Model's turn - get its move
             with torch.no_grad():
-                tensor = board_to_tensor(board)
+                tensor = board_to_tensor_2d(board) if USE_CNN else board_to_tensor(board)
                 x = torch.tensor(tensor, dtype=torch.float32).unsqueeze(0).to(device)
                 mask = get_legal_move_mask(board).to(device).unsqueeze(0)
 
@@ -348,7 +372,7 @@ def generate_imitation_data(stockfish, num_positions=200):
                 break
 
             # Create training sample
-            tensor = board_to_tensor(board)
+            tensor = board_to_tensor_2d(board) if USE_CNN else board_to_tensor(board)
 
             policy_target = np.zeros(POLICY_OUTPUT_SIZE, dtype=np.float32)
             policy_target[encode_move(sf_move)] = 1.0
@@ -432,10 +456,13 @@ def run_training(hours, model_path, mode="imitation"):
 
     init_log_file()
 
+    arch = "cnn" if USE_CNN else "mlp"
+
     log("=" * 60)
     log("STOCKFISH TEACHER TRAINING")
     log("=" * 60)
     log(f"Mode: {mode}")
+    log(f"Architecture: {arch.upper()}")
     log(f"Duration: {hours} hours")
     end_time = datetime.now() + timedelta(hours=hours)
     log(f"End time: {end_time}")
@@ -454,7 +481,7 @@ def run_training(hours, model_path, mode="imitation"):
     data_dir = Path("data/training")
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    model = load_or_create_model(model_path, device)
+    model = load_or_create_model(model_path, device, architecture=arch)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     stockfish = StockfishTeacher(STOCKFISH_PATH, elo=INITIAL_ELO)
@@ -570,14 +597,19 @@ def run_training(hours, model_path, mode="imitation"):
 
 
 def main():
+    global USE_CNN
     parser = argparse.ArgumentParser(description="Stockfish Teacher Training")
     parser.add_argument("--hours", type=float, default=2.0, help="Training duration")
     parser.add_argument("--model", type=str, default="models/dual_model_mcts.pt", help="Model path")
     parser.add_argument("--mode", type=str, default="imitation",
                         choices=["imitation", "play"],
                         help="Training mode: 'imitation' or 'play'")
+    parser.add_argument("--arch", type=str, default="cnn",
+                        choices=["cnn", "mlp"],
+                        help="Architecture: 'cnn' (ResNet) or 'mlp' (flat)")
     args = parser.parse_args()
 
+    USE_CNN = (args.arch == "cnn")
     run_training(args.hours, args.model, args.mode)
 
 
