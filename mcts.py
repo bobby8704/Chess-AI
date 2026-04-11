@@ -659,6 +659,9 @@ def _apply_heuristic_boosts(
     # --- 10. Checkmate forcing: when opponent has lone king, boost restricting moves ---
     move_probs = _boost_mate_forcing(board, move_probs, our_color)
 
+    # --- 11. Simplification: when ahead in material, boost equal trades ---
+    move_probs = _boost_simplification(board, move_probs, our_color)
+
     return move_probs
 
 
@@ -757,6 +760,58 @@ def _is_passed_pawn(board: chess.Board, square: chess.Square, color: chess.Color
             if p and p.piece_type == chess.PAWN and p.color == opponent:
                 return False
     return True
+
+
+def _boost_simplification(
+    board: chess.Board,
+    move_probs: Dict[chess.Move, float],
+    color: chess.Color
+) -> Dict[chess.Move, float]:
+    """
+    When we're ahead in material, boost trades (captures where opponent recaptures).
+    Simplifying when ahead makes the advantage easier to convert.
+    When behind, penalize trades (keep pieces on the board for counterplay).
+    """
+    # Calculate our material advantage
+    material = calculate_material(board)
+    our_advantage = material if color == chess.WHITE else -material
+
+    if abs(our_advantage) < 2.0:
+        return move_probs  # Roughly equal — no simplification pressure
+
+    for move in list(move_probs.keys()):
+        if not board.is_capture(move):
+            continue
+
+        piece = board.piece_at(move.from_square)
+        captured = board.piece_at(move.to_square)
+        if piece is None or captured is None:
+            continue
+
+        piece_val = PIECE_VALUES.get(piece.piece_type, 0)
+        captured_val = PIECE_VALUES.get(captured.piece_type, 0)
+
+        # Is this a roughly equal trade? (within 1 pawn of value)
+        is_equal_trade = abs(piece_val - captured_val) <= 1.0
+
+        if our_advantage >= 2.0:
+            # We're AHEAD — boost equal trades to simplify
+            if is_equal_trade:
+                # Don't trade queens unless way ahead (queen trades reduce mating chances)
+                if piece.piece_type == chess.QUEEN and captured.piece_type == chess.QUEEN:
+                    if our_advantage >= 8.0:
+                        move_probs[move] = max(move_probs[move], 0.2)
+                    else:
+                        move_probs[move] *= 0.5  # Avoid queen trades unless dominant
+                else:
+                    # Trade knights, bishops, rooks — simplify!
+                    move_probs[move] = max(move_probs[move], 0.18)
+        elif our_advantage <= -2.0:
+            # We're BEHIND — avoid equal trades, keep pieces for complications
+            if is_equal_trade:
+                move_probs[move] *= 0.5
+
+    return move_probs
 
 
 def _boost_mate_forcing(
