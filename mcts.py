@@ -656,6 +656,9 @@ def _apply_heuristic_boosts(
     # --- 9. King safety: penalize pawn pushes near castled king ---
     move_probs = _penalize_king_shelter_weakening(board, move_probs, our_color)
 
+    # --- 10. Checkmate forcing: when opponent has lone king, boost restricting moves ---
+    move_probs = _boost_mate_forcing(board, move_probs, our_color)
+
     return move_probs
 
 
@@ -754,6 +757,140 @@ def _is_passed_pawn(board: chess.Board, square: chess.Square, color: chess.Color
             if p and p.piece_type == chess.PAWN and p.color == opponent:
                 return False
     return True
+
+
+def _boost_mate_forcing(
+    board: chess.Board,
+    move_probs: Dict[chess.Move, float],
+    color: chess.Color
+) -> Dict[chess.Move, float]:
+    """
+    When the opponent has only a king, boost moves that restrict its mobility
+    and drive it toward the edge. This guides MCTS toward the mating pattern.
+    """
+    opponent = not color
+
+    # Check if opponent has only a king
+    opp_pieces = board.pieces(chess.PAWN, opponent) | \
+                 board.pieces(chess.KNIGHT, opponent) | \
+                 board.pieces(chess.BISHOP, opponent) | \
+                 board.pieces(chess.ROOK, opponent) | \
+                 board.pieces(chess.QUEEN, opponent)
+    if len(opp_pieces) > 0:
+        return move_probs
+
+    opp_king = board.king(opponent)
+    our_king = board.king(color)
+    if opp_king is None or our_king is None:
+        return move_probs
+
+    # Count opponent king's current escape squares
+    def count_escapes(b, king_sq, attacker_color):
+        escapes = 0
+        for delta_f in [-1, 0, 1]:
+            for delta_r in [-1, 0, 1]:
+                if delta_f == 0 and delta_r == 0:
+                    continue
+                f = chess.square_file(king_sq) + delta_f
+                r = chess.square_rank(king_sq) + delta_r
+                if 0 <= f <= 7 and 0 <= r <= 7:
+                    sq = chess.square(f, r)
+                    if not b.is_attacked_by(attacker_color, sq):
+                        p = b.piece_at(sq)
+                        if p is None or p.color == attacker_color:
+                            escapes += 1
+        return escapes
+
+    current_escapes = count_escapes(board, opp_king, color)
+
+    for move in list(move_probs.keys()):
+        board_after = board.copy()
+        board_after.push(move)
+
+        if board_after.is_checkmate():
+            move_probs[move] = max(move_probs[move], 0.99)
+            continue
+
+        if board_after.is_stalemate():
+            move_probs[move] *= 0.001
+            continue
+
+        # How many escapes does the opponent king have after this move?
+        new_opp_king = board_after.king(opponent)
+        if new_opp_king is None:
+            continue
+        new_escapes = count_escapes(board_after, new_opp_king, color)
+
+        # Reward moves that reduce escape squares
+        if new_escapes < current_escapes:
+            reduction = current_escapes - new_escapes
+            move_probs[move] = max(move_probs[move], 0.15 + reduction * 0.1)
+
+        # Reward king approach (our king moving closer)
+        piece = board.piece_at(move.from_square)
+        if piece and piece.piece_type == chess.KING:
+            old_dist = max(abs(chess.square_file(our_king) - chess.square_file(opp_king)),
+                          abs(chess.square_rank(our_king) - chess.square_rank(opp_king)))
+            new_dist = max(abs(chess.square_file(move.to_square) - chess.square_file(opp_king)),
+                          abs(chess.square_rank(move.to_square) - chess.square_rank(opp_king)))
+            if new_dist < old_dist:
+                move_probs[move] = max(move_probs[move], 0.2)
+
+    return move_probs
+
+
+def _select_lone_king_mate_move(board: chess.Board) -> Optional[chess.Move]:
+    """
+    When opponent has only a king, use eval-based 1-ply search to find the
+    best forcing move. Bypasses MCTS since search depth is the bottleneck.
+    Picks the move that maximizes the hand-coded eval (which rewards
+    driving the king to the edge and restricting its squares).
+    """
+    our_color = board.turn
+    opponent = not our_color
+
+    # Check if opponent has only a king
+    opp_pieces = board.pieces(chess.PAWN, opponent) | \
+                 board.pieces(chess.KNIGHT, opponent) | \
+                 board.pieces(chess.BISHOP, opponent) | \
+                 board.pieces(chess.ROOK, opponent) | \
+                 board.pieces(chess.QUEEN, opponent)
+    if len(opp_pieces) > 0:
+        return None
+
+    # Need mating material
+    our_queens = len(board.pieces(chess.QUEEN, our_color))
+    our_rooks = len(board.pieces(chess.ROOK, our_color))
+    if our_queens == 0 and our_rooks == 0:
+        return None
+
+    from evaluation import evaluate as hc_evaluate
+
+    best_move = None
+    best_score = float('-inf')
+
+    for move in board.legal_moves:
+        board.push(move)
+
+        if board.is_checkmate():
+            board.pop()
+            return move  # Immediate mate — take it
+
+        if board.is_stalemate():
+            board.pop()
+            continue  # Skip stalemate moves
+
+        # Evaluate from opponent's perspective (after our move, it's their turn)
+        # Negate to get our perspective
+        score = -hc_evaluate(board)
+
+        board.pop()
+
+        if score > best_score:
+            best_score = score
+            best_move = move
+
+    return best_move
 
 
 class MCTSPlayer:
@@ -890,6 +1027,14 @@ class MCTSPlayer:
         Returns:
             Selected move, or (move, policy_dict) if return_policy=True
         """
+        # Lone king endgame: bypass MCTS and use eval-based 1-ply search
+        # MCTS can't search deep enough to find forced mate patterns
+        lone_king_move = _select_lone_king_mate_move(board)
+        if lone_king_move is not None:
+            if return_policy:
+                return lone_king_move, {lone_king_move: 1.0}
+            return lone_king_move
+
         if temperature is not None:
             old_temp = self.config.temperature
             self.config.temperature = temperature

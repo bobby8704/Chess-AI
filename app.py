@@ -140,6 +140,11 @@ def new_game():
     if difficulty not in DIFFICULTY_PRESETS:
         difficulty = "hard"
 
+    # Archive any existing games that haven't been archived yet
+    for old_id, old_board in list(games.items()):
+        if old_id not in [g["game_id"] for g in completed_games]:
+            _archive_game(old_id, old_board)
+
     game_id = uuid.uuid4().hex[:12]
     board = chess.Board()
     games[game_id] = board
@@ -215,6 +220,14 @@ def make_move():
     # --- AI reply (fresh player per move to avoid memory bloat from stale trees) ---
     difficulty = game_difficulty.get(game_id, "hard")
     num_sims = DIFFICULTY_PRESETS.get(difficulty, 300)
+
+    # Boost sims in lone-king endgames to find checkmate faster
+    opponent_pieces = sum(1 for sq in chess.SQUARES
+                         if board.piece_at(sq) and board.piece_at(sq).color == chess.WHITE
+                         and board.piece_at(sq).piece_type != chess.KING)
+    if opponent_pieces == 0:
+        num_sims = max(num_sims, 800)  # Lone king: search deeper for mate
+
     player = _make_player(num_sims)
 
     start = time.time()

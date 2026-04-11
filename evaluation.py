@@ -285,6 +285,81 @@ def _mobility(board: chess.Board, color: bool) -> int:
 
 
 # ============================================================
+# Checkmate forcing (endgame with major pieces vs lone king)
+# ============================================================
+
+# Distance from center: corners = 3, edges = 2, center = 0
+_CENTER_DISTANCE = [
+    3, 2, 2, 2, 2, 2, 2, 3,
+    2, 1, 1, 1, 1, 1, 1, 2,
+    2, 1, 0, 0, 0, 0, 1, 2,
+    2, 1, 0, 0, 0, 0, 1, 2,
+    2, 1, 0, 0, 0, 0, 1, 2,
+    2, 1, 0, 0, 0, 0, 1, 2,
+    2, 1, 1, 1, 1, 1, 1, 2,
+    3, 2, 2, 2, 2, 2, 2, 3,
+]
+
+
+def _king_distance(sq1: int, sq2: int) -> int:
+    """Chebyshev distance between two squares."""
+    f1, r1 = chess.square_file(sq1), chess.square_rank(sq1)
+    f2, r2 = chess.square_file(sq2), chess.square_rank(sq2)
+    return max(abs(f1 - f2), abs(r1 - r2))
+
+
+def _checkmate_forcing(board: chess.Board, strong_side: bool) -> int:
+    """
+    When strong_side has major pieces and weak_side has only a king,
+    return bonuses for driving the lone king to the edge and keeping
+    the strong king close. Returns centipawns for strong_side.
+    """
+    weak_side = not strong_side
+
+    # Check if weak side has only a king
+    weak_pieces = board.pieces(chess.PAWN, weak_side) | \
+                  board.pieces(chess.KNIGHT, weak_side) | \
+                  board.pieces(chess.BISHOP, weak_side) | \
+                  board.pieces(chess.ROOK, weak_side) | \
+                  board.pieces(chess.QUEEN, weak_side)
+    if len(weak_pieces) > 0:
+        return 0  # Opponent still has pieces, not a lone king situation
+
+    # Check that strong side has enough mating material
+    strong_queens = len(board.pieces(chess.QUEEN, strong_side))
+    strong_rooks = len(board.pieces(chess.ROOK, strong_side))
+    if strong_queens == 0 and strong_rooks == 0:
+        return 0  # Need at least a queen or rook to force mate
+
+    score = 0
+    weak_king = board.king(weak_side)
+    strong_king = board.king(strong_side)
+    if weak_king is None or strong_king is None:
+        return 0
+
+    # 1. Reward pushing opponent king to edge/corner (most important)
+    # Center distance: 0 (center) to 3 (corner)
+    score += _CENTER_DISTANCE[weak_king] * 150
+
+    # 2. Reward keeping strong king close to weak king (assists mate)
+    king_dist = _king_distance(weak_king, strong_king)
+    score += (7 - king_dist) * 80
+
+    # 3. Bonus for restricting opponent king's mobility
+    weak_king_moves = 0
+    for sq in chess.SQUARES:
+        if _king_distance(weak_king, sq) == 1:
+            if not board.is_attacked_by(strong_side, sq):
+                p = board.piece_at(sq)
+                if p is None or p.color == strong_side:
+                    weak_king_moves += 1
+    # Fewer escape squares = better (max 8, min 0)
+    score += (8 - weak_king_moves) * 50
+
+    return score
+
+
+# ============================================================
 # Main evaluation function
 # ============================================================
 
@@ -362,6 +437,11 @@ def evaluate(board: chess.Board) -> float:
                 score += sign * 25  # Open file
             elif not own_pawns:
                 score += sign * 15  # Semi-open file
+
+    # 7. Checkmate forcing: when one side has overwhelming material vs lone king,
+    # add bonuses for driving the losing king to the edge and keeping kings close
+    score += _checkmate_forcing(board, chess.WHITE)
+    score -= _checkmate_forcing(board, chess.BLACK)
 
     # Convert to current player's perspective and normalize
     if board.turn == chess.BLACK:
