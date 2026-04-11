@@ -1087,8 +1087,16 @@ class MCTSPlayer:
         Returns:
             Selected move, or (move, policy_dict) if return_policy=True
         """
-        # Lone king endgame: bypass MCTS and use eval-based 1-ply search
-        # MCTS can't search deep enough to find forced mate patterns
+        # Endgame tablebase: perfect play for ≤7 pieces
+        import tablebase
+        if tablebase.should_probe(board):
+            tb_move = tablebase.probe(board)
+            if tb_move is not None:
+                if return_policy:
+                    return tb_move, {tb_move: 1.0}
+                return tb_move
+
+        # Fallback: lone king eval-based search (when tablebase unavailable)
         lone_king_move = _select_lone_king_mate_move(board)
         if lone_king_move is not None:
             if return_policy:
