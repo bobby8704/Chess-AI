@@ -433,7 +433,9 @@ class DualNetCNN(nn.Module):
 
 # ==================== Model Loading Utilities ====================
 
-_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Force CPU for inference — single-position MCTS is faster on CPU than GPU
+# (GPU overhead from data transfer outweighs parallelism for batch_size=1)
+_device = torch.device("cpu")
 _dual_model: Optional[DualNet] = None
 
 
