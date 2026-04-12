@@ -25,9 +25,9 @@ MODEL_PATH = "models/dual_model_mcts.pt"
 
 # Difficulty presets: name -> simulations
 DIFFICULTY_PRESETS = {
-    "easy": 100,
-    "medium": 250,
-    "hard": 500,
+    "easy": 200,
+    "medium": 500,
+    "hard": 1200,
 }
 
 print("Loading chess AI model...")

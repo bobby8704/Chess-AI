@@ -406,7 +406,8 @@ class MCTS:
     def __init__(
         self,
         config: MCTSConfig = None,
-        evaluate_fn=None
+        evaluate_fn=None,
+        root_evaluate_fn=None
     ):
         """
         Initialize MCTS.
@@ -414,10 +415,14 @@ class MCTS:
         Args:
             config: MCTS configuration
             evaluate_fn: Function (board) -> (move_probs, value)
-                        If None, uses uniform policy and zero value
+                        Used for non-root nodes (fast path)
+            root_evaluate_fn: Function (board) -> (move_probs, value)
+                        Used for root node only (includes heuristics/blunder checks)
+                        If None, uses evaluate_fn for root too
         """
         self.config = config or MCTSConfig()
         self.evaluate_fn = evaluate_fn or self._default_evaluate
+        self.root_evaluate_fn = root_evaluate_fn
 
     def _default_evaluate(
         self,
@@ -454,8 +459,9 @@ class MCTS:
         # Create root node
         root = MCTSNode(board)
 
-        # Expand root
-        move_probs, _ = self.evaluate_fn(board)
+        # Expand root (use full evaluate with heuristics)
+        root_eval_fn = self.root_evaluate_fn or self.evaluate_fn
+        move_probs, _ = root_eval_fn(board)
         root.expand(move_probs)
 
         # Add exploration noise at root during training
@@ -465,7 +471,7 @@ class MCTS:
                 self.config.dirichlet_epsilon
             )
 
-        # Run simulations
+        # Run simulations (use fast evaluate for non-root nodes)
         for _ in range(num_sims):
             node = root
             path = [node]
@@ -479,7 +485,7 @@ class MCTS:
             if node.is_terminal:
                 value = node.terminal_value
             else:
-                # Expand and evaluate
+                # Expand and evaluate (fast path — no heuristics/blunder checks)
                 move_probs, value = self.evaluate_fn(node.board)
                 node.expand(move_probs)
 
@@ -980,25 +986,24 @@ class MCTSPlayer:
             model.to(self.device)
             model.eval()
 
-        self.mcts = MCTS(config=self.config, evaluate_fn=self._evaluate)
+        # Fast evaluate for non-root nodes, full evaluate for root only
+        self.mcts = MCTS(
+            config=self.config,
+            evaluate_fn=self._evaluate_fast,
+            root_evaluate_fn=self._evaluate_full,
+        )
 
-    def _evaluate(
-        self,
-        board: chess.Board
-    ) -> Tuple[Dict[chess.Move, float], float]:
-        """Evaluate position using neural network with optional material hybrid."""
+    def _nn_forward(self, board: chess.Board):
+        """Run NN forward pass and return (move_probs_dict, nn_value)."""
         import torch
-        from neural_network import get_legal_move_mask, encode_move, POLICY_OUTPUT_SIZE
+        from neural_network import get_legal_move_mask, encode_move, POLICY_OUTPUT_SIZE, is_cnn_model
 
         if self.model is None:
-            # Uniform policy, zero value
             legal_moves = list(board.legal_moves)
             if not legal_moves:
                 return {}, 0.0
             return {m: 1.0 / len(legal_moves) for m in legal_moves}, 0.0
 
-        # Convert to tensor (2D for CNN, flat for MLP)
-        from neural_network import is_cnn_model
         if is_cnn_model(self.model):
             from features import board_to_tensor_2d
             x = torch.from_numpy(board_to_tensor_2d(board)).float().to(self.device).unsqueeze(0)
@@ -1010,26 +1015,47 @@ class MCTSPlayer:
             policy_probs, nn_value = self.model.get_policy_value(x, mask)
 
         policy_probs = policy_probs.squeeze(0).cpu().numpy()
-        nn_value = nn_value.item()
-
-        # Note: NN value head is trained to output from the current player's
-        # perspective (positive = good for side to move). No perspective flip needed.
-
-        # Convert to move dictionary
         move_probs = {}
         for move in board.legal_moves:
             idx = encode_move(move)
             if idx < POLICY_OUTPUT_SIZE:
                 move_probs[move] = float(policy_probs[idx])
 
-        # === Heuristic policy adjustments (compensate for NN weaknesses) ===
-        move_probs = _apply_heuristic_boosts(board, move_probs)
+        return move_probs, nn_value.item()
 
-        # === Position value: use hand-coded eval (much stronger than NN value head) ===
+    def _evaluate_fast(
+        self,
+        board: chess.Board
+    ) -> Tuple[Dict[chess.Move, float], float]:
+        """Fast evaluation for non-root nodes: NN policy + hand-coded value only.
+        Skips heuristic boosts and blunder detection for speed."""
+        move_probs, _ = self._nn_forward(board)
+
         from evaluation import evaluate as hc_evaluate
         value = hc_evaluate(board)
 
-        # Analyze all moves for blunders and penalize them in policy
+        # Normalize
+        total = sum(move_probs.values())
+        if total > 0:
+            move_probs = {m: p / total for m, p in move_probs.items()}
+
+        return move_probs, value
+
+    def _evaluate_full(
+        self,
+        board: chess.Board
+    ) -> Tuple[Dict[chess.Move, float], float]:
+        """Full evaluation for root node: NN + heuristics + blunder detection."""
+        move_probs, _ = self._nn_forward(board)
+
+        # Heuristic policy adjustments (only at root — too expensive per-sim)
+        move_probs = _apply_heuristic_boosts(board, move_probs)
+
+        # Hand-coded position value
+        from evaluation import evaluate as hc_evaluate
+        value = hc_evaluate(board)
+
+        # Blunder detection (only at root)
         blunder_moves = {}
         safe_moves = {}
         for move, prob in move_probs.items():
