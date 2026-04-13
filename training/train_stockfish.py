@@ -61,9 +61,10 @@ STOCKFISH_TIME_LIMIT = 0.15  # Time limit per move in seconds
 # Training settings
 BATCH_SIZE = 128
 LEARNING_RATE = 0.0005
+WEIGHT_DECAY = 1e-4  # L2 regularization to prevent overfitting
 GAMES_PER_ITER = 5
 MAX_GAME_MOVES = 100
-TRAIN_EPOCHS = 5
+TRAIN_EPOCHS = 3  # Fewer epochs per batch to avoid memorization
 
 # Difficulty progression
 # Start with intermediate Stockfish since model already plays well
@@ -320,26 +321,45 @@ def generate_training_game(model, stockfish, device, model_plays_white=True):
 
 
 _COMMON_OPENINGS = [
-    # Sicilian, French, Caro-Kann, Italian, Ruy Lopez, Queen's Gambit, etc.
+    # e4 openings
     "e2e4 e7e5", "e2e4 c7c5", "e2e4 e7e6", "e2e4 c7c6", "e2e4 d7d5",
-    "d2d4 d7d5", "d2d4 g8f6", "d2d4 d7d5 c2c4", "d2d4 d7d5 c2c4 e7e6",
-    "e2e4 e7e5 g1f3 b8c6", "e2e4 e7e5 g1f3 b8c6 f1c4",
-    "e2e4 e7e5 g1f3 b8c6 f1b5", "d2d4 d7d5 c2c4 c7c6",
+    "e2e4 d7d6", "e2e4 g7g6", "e2e4 b7b6", "e2e4 g8f6",
+    # e4 e5 systems
+    "e2e4 e7e5 g1f3 b8c6 f1c4", "e2e4 e7e5 g1f3 b8c6 f1b5",
+    "e2e4 e7e5 g1f3 b8c6 d2d4", "e2e4 e7e5 g1f3 g8f6",
+    "e2e4 e7e5 f1c4", "e2e4 e7e5 d2d4",
+    # Sicilian variations
     "e2e4 c7c5 g1f3 d7d6", "e2e4 c7c5 g1f3 b8c6",
-    "d2d4 g8f6 c2c4 g7g6", "c2c4 e7e5", "g1f3 d7d5",
-    "e2e4 e7e5 g1f3 g8f6", "d2d4 d7d5 g1f3 g8f6",
-    "",  # starting position (no opening moves)
+    "e2e4 c7c5 g1f3 e7e6", "e2e4 c7c5 b1c3",
+    # French, Caro-Kann
+    "e2e4 e7e6 d2d4 d7d5", "e2e4 c7c6 d2d4 d7d5",
+    # d4 openings
+    "d2d4 d7d5", "d2d4 g8f6", "d2d4 d7d5 c2c4", "d2d4 d7d5 c2c4 e7e6",
+    "d2d4 d7d5 c2c4 c7c6", "d2d4 d7d5 g1f3 g8f6",
+    "d2d4 g8f6 c2c4 g7g6", "d2d4 g8f6 c2c4 e7e6",
+    "d2d4 d7d5 c1f4", "d2d4 f7f5",
+    # English, Reti, others
+    "c2c4 e7e5", "c2c4 g8f6", "g1f3 d7d5", "g1f3 g8f6",
+    "b2b3 e7e5", "g2g3 d7d5", "f2f4 d7d5",
+    "",  # starting position
 ]
+
+def _make_random_position(max_moves=20):
+    """Generate a random legal position by playing random moves.
+    Creates diverse positions the model wouldn't see in normal games."""
+    board = chess.Board()
+    n = random.randint(4, max_moves)
+    for _ in range(n):
+        if board.is_game_over():
+            break
+        legal = list(board.legal_moves)
+        board.push(random.choice(legal))
+    return board
 
 def generate_imitation_data(stockfish, num_positions=200):
     """
-    Generate training data by having Stockfish play itself.
-    Model learns to imitate Stockfish's moves.
-
-    Value target is from the CURRENT PLAYER's perspective:
-    - Positive = good for side to move
-    - Negative = bad for side to move
-    This ensures the NN learns perspective-correct evaluation.
+    Generate training data by having Stockfish play from diverse positions.
+    Mix of: 50% real openings, 25% random positions, 25% deep random positions.
     """
     training_data = []
 
@@ -347,8 +367,10 @@ def generate_imitation_data(stockfish, num_positions=200):
         board = chess.Board()
         move_count = 0
 
-        # Use real openings for realistic positions (with some randomization)
-        if random.random() < 0.7:
+        # Diverse starting positions: heavy on openings for good development
+        roll = random.random()
+        if roll < 0.70:
+            # 70%: real openings (35+ variations) — teaches proper development
             opening = random.choice(_COMMON_OPENINGS)
             for uci in opening.split():
                 if uci:
@@ -356,14 +378,12 @@ def generate_imitation_data(stockfish, num_positions=200):
                         board.push_uci(uci)
                     except ValueError:
                         break
+        elif roll < 0.85:
+            # 15%: shallow random positions (4-12 moves — early middlegame)
+            board = _make_random_position(max_moves=12)
         else:
-            # 30% random openings for variety
-            for _ in range(random.randint(4, 10)):
-                if board.is_game_over():
-                    break
-                legal = list(board.legal_moves)
-                if legal:
-                    board.push(random.choice(legal))
+            # 15%: deep random positions (12-25 moves — middlegame/endgame)
+            board = _make_random_position(max_moves=25)
 
         # Now collect Stockfish moves
         while not board.is_game_over() and move_count < 40:
@@ -482,7 +502,7 @@ def run_training(hours, model_path, mode="imitation"):
     data_dir.mkdir(parents=True, exist_ok=True)
 
     model = load_or_create_model(model_path, device, architecture=arch)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
     stockfish = StockfishTeacher(STOCKFISH_PATH, elo=INITIAL_ELO)
 

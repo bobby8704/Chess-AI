@@ -382,15 +382,20 @@ class DualNetCNN(nn.Module):
             *[ConvResBlock(num_filters) for _ in range(num_res_blocks)]
         )
 
-        # Policy head: conv 1x1 -> flatten -> FC -> 4288
+        # Policy head: conv 1x1 -> flatten -> FC(256) -> dropout -> FC(4288)
         self.policy_conv = nn.Sequential(
             nn.Conv2d(num_filters, 32, 1, bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(),
         )
-        self.policy_fc = nn.Linear(32 * 64, POLICY_OUTPUT_SIZE)
+        self.policy_fc = nn.Sequential(
+            nn.Linear(32 * 64, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, POLICY_OUTPUT_SIZE),
+        )
 
-        # Value head: conv 1x1 -> flatten -> FC -> FC -> tanh
+        # Value head: conv 1x1 -> flatten -> FC(128) -> dropout -> FC(1) -> tanh
         self.value_conv = nn.Sequential(
             nn.Conv2d(num_filters, 1, 1, bias=False),
             nn.BatchNorm2d(1),
@@ -399,6 +404,7 @@ class DualNetCNN(nn.Module):
         self.value_fc = nn.Sequential(
             nn.Linear(64, 128),
             nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(128, 1),
             nn.Tanh(),
         )
