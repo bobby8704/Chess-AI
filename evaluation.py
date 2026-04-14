@@ -443,9 +443,173 @@ def evaluate(board: chess.Board) -> float:
     score += _checkmate_forcing(board, chess.WHITE)
     score -= _checkmate_forcing(board, chess.BLACK)
 
+    # 8. Back-rank safety: penalize king trapped on back rank with no escape
+    score += _back_rank_safety(board, chess.WHITE)
+    score -= _back_rank_safety(board, chess.BLACK)
+
     # Convert to current player's perspective and normalize
     if board.turn == chess.BLACK:
         score = -score
 
     # Normalize: 100cp = ~0.25, 400cp = ~0.76, 900cp = ~0.97
     return math.tanh(score / 400.0)
+
+
+# ============================================================
+# Back-rank safety
+# ============================================================
+
+def _back_rank_safety(board: chess.Board, color: bool) -> int:
+    """Penalize king trapped on back rank with no escape (back-rank mate risk)."""
+    king_sq = board.king(color)
+    if king_sq is None:
+        return 0
+
+    back_rank = 0 if color == chess.WHITE else 7
+    king_rank = chess.square_rank(king_sq)
+
+    if king_rank != back_rank:
+        return 0  # King not on back rank, no penalty
+
+    king_file = chess.square_file(king_sq)
+
+    # Check if king has an escape square (one rank forward)
+    escape_rank = 1 if color == chess.WHITE else 6
+    has_escape = False
+    for f in range(max(0, king_file - 1), min(7, king_file + 1) + 1):
+        sq = chess.square(f, escape_rank)
+        piece = board.piece_at(sq)
+        # Square is an escape if it's empty or has an opponent piece (king can capture)
+        # and isn't attacked by opponent
+        if piece is None or piece.color != color:
+            if not board.is_attacked_by(not color, sq):
+                has_escape = True
+                break
+
+    if has_escape:
+        return 0
+
+    # King is trapped on back rank — check if opponent has a rook/queen
+    opponent = not color
+    opp_rooks = len(board.pieces(chess.ROOK, opponent))
+    opp_queens = len(board.pieces(chess.QUEEN, opponent))
+
+    if opp_rooks + opp_queens == 0:
+        return 0  # No back-rank mate threat without rooks/queens
+
+    # Significant penalty — back rank is very dangerous
+    return -80 * (opp_rooks + opp_queens)
+
+
+# ============================================================
+# Quiescence search
+# ============================================================
+
+def evaluate_quiescence(board: chess.Board, max_depth: int = 6) -> float:
+    """
+    Evaluate a position with quiescence search.
+
+    Extends the evaluation by playing out all captures until the position
+    is "quiet" (no more profitable captures). This prevents the AI from
+    evaluating positions mid-capture-sequence as stable.
+
+    Returns value from current player's perspective in [-1, +1].
+    """
+    return math.tanh(_quiescence(board, max_depth, -100000, 100000) / 400.0)
+
+
+def _quiescence(board: chess.Board, depth: int, alpha: int, beta: int) -> int:
+    """
+    Quiescence search in centipawns from current player's perspective.
+    Only searches capture moves to resolve tactical instability.
+    Uses alpha-beta pruning for efficiency.
+    """
+    if board.is_checkmate():
+        return -30000
+
+    if board.is_stalemate() or board.is_insufficient_material() or board.can_claim_draw():
+        return 0
+
+    # Standing pat: evaluate the position statically
+    stand_pat = _evaluate_raw(board)
+
+    if depth <= 0:
+        return stand_pat
+
+    if stand_pat >= beta:
+        return beta  # Beta cutoff
+
+    if stand_pat > alpha:
+        alpha = stand_pat
+
+    # Search only captures (and promotions), ordered by MVV-LVA
+    captures = []
+    for i, move in enumerate(board.legal_moves):
+        if board.is_capture(move) or move.promotion:
+            # MVV-LVA: Most Valuable Victim - Least Valuable Attacker
+            victim = board.piece_at(move.to_square)
+            victim_val = PIECE_VALUE.get(victim.piece_type, 0) if victim else 0
+            attacker = board.piece_at(move.from_square)
+            attacker_val = PIECE_VALUE.get(attacker.piece_type, 0) if attacker else 0
+            # Also give bonus for promotions
+            promo_val = 800 if move.promotion == chess.QUEEN else 0
+            captures.append((-(victim_val - attacker_val + promo_val), i, move))
+
+    captures.sort(key=lambda x: x[0])  # Best captures first
+
+    for _, _, move in captures:
+        board.push(move)
+        score = -_quiescence(board, depth - 1, -beta, -alpha)
+        board.pop()
+
+        if score >= beta:
+            return beta
+
+        if score > alpha:
+            alpha = score
+
+    return alpha
+
+
+def _evaluate_raw(board: chess.Board) -> int:
+    """
+    Raw evaluation in centipawns from current player's perspective.
+    Used internally by quiescence search (no tanh normalization).
+    """
+    if board.is_checkmate():
+        return -30000
+    if board.is_stalemate() or board.is_insufficient_material():
+        return 0
+
+    score = 0
+    eg_weight = _game_phase(board)
+
+    for sq in chess.SQUARES:
+        piece = board.piece_at(sq)
+        if piece is None:
+            continue
+        val = PIECE_VALUE[piece.piece_type]
+        val += _pst_value(piece.piece_type, sq, piece.color, eg_weight)
+        if piece.color == chess.WHITE:
+            score += val
+        else:
+            score -= val
+
+    score += _pawn_structure(board, chess.WHITE)
+    score -= _pawn_structure(board, chess.BLACK)
+
+    mg_weight = 1.0 - eg_weight
+    score += int(_king_safety(board, chess.WHITE) * mg_weight)
+    score -= int(_king_safety(board, chess.BLACK) * mg_weight)
+
+    score += _back_rank_safety(board, chess.WHITE)
+    score -= _back_rank_safety(board, chess.BLACK)
+
+    score += _checkmate_forcing(board, chess.WHITE)
+    score -= _checkmate_forcing(board, chess.BLACK)
+
+    # Convert to current player's perspective
+    if board.turn == chess.BLACK:
+        score = -score
+
+    return score

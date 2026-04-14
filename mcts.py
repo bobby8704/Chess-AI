@@ -1027,12 +1027,12 @@ class MCTSPlayer:
         self,
         board: chess.Board
     ) -> Tuple[Dict[chess.Move, float], float]:
-        """Fast evaluation for non-root nodes: NN policy + hand-coded value only.
-        Skips heuristic boosts and blunder detection for speed."""
+        """Fast evaluation for non-root nodes: NN policy + quiescence search value.
+        Quiescence extends captures to avoid evaluating unstable positions."""
         move_probs, _ = self._nn_forward(board)
 
-        from evaluation import evaluate as hc_evaluate
-        value = hc_evaluate(board)
+        from evaluation import evaluate_quiescence
+        value = evaluate_quiescence(board)
 
         # Normalize
         total = sum(move_probs.values())
@@ -1051,9 +1051,9 @@ class MCTSPlayer:
         # Heuristic policy adjustments (only at root — too expensive per-sim)
         move_probs = _apply_heuristic_boosts(board, move_probs)
 
-        # Hand-coded position value
-        from evaluation import evaluate as hc_evaluate
-        value = hc_evaluate(board)
+        # Position value with quiescence search (plays out captures)
+        from evaluation import evaluate_quiescence
+        value = evaluate_quiescence(board)
 
         # Blunder detection (only at root)
         blunder_moves = {}
