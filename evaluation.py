@@ -285,6 +285,111 @@ def _mobility(board: chess.Board, color: bool) -> int:
 
 
 # ============================================================
+# Knight outposts
+# ============================================================
+
+def _knight_outposts(board: chess.Board, color: bool) -> int:
+    """Bonus for knights on outpost squares (protected by pawn, can't be attacked by enemy pawn)."""
+    score = 0
+    opponent = not color
+    for sq in board.pieces(chess.KNIGHT, color):
+        rank = chess.square_rank(sq)
+        file = chess.square_file(sq)
+
+        # Outpost = on rank 4-6 (for white), protected by own pawn, no enemy pawn can attack
+        if color == chess.WHITE:
+            if rank < 3 or rank > 5:
+                continue
+        else:
+            if rank < 2 or rank > 4:
+                continue
+
+        # Check if protected by own pawn
+        pawn_protectors = board.attackers(color, sq) & board.pieces(chess.PAWN, color)
+        if not pawn_protectors:
+            continue
+
+        # Check no enemy pawn can attack this square (on adjacent files, ahead)
+        can_be_kicked = False
+        for adj_f in [file - 1, file + 1]:
+            if adj_f < 0 or adj_f > 7:
+                continue
+            if color == chess.WHITE:
+                check_ranks = range(rank + 1, 8)
+            else:
+                check_ranks = range(0, rank)
+            for r in check_ranks:
+                p = board.piece_at(chess.square(adj_f, r))
+                if p and p.piece_type == chess.PAWN and p.color == opponent:
+                    can_be_kicked = True
+                    break
+            if can_be_kicked:
+                break
+
+        if not can_be_kicked:
+            score += 30  # Strong outpost
+
+    return score
+
+
+# ============================================================
+# Connected rooks
+# ============================================================
+
+def _connected_rooks(board: chess.Board, color: bool) -> int:
+    """Bonus for rooks that defend each other (on same rank/file with nothing between)."""
+    rooks = list(board.pieces(chess.ROOK, color))
+    if len(rooks) < 2:
+        return 0
+
+    r1, r2 = rooks[0], rooks[1]
+    f1, rk1 = chess.square_file(r1), chess.square_rank(r1)
+    f2, rk2 = chess.square_file(r2), chess.square_rank(r2)
+
+    # Same rank or same file?
+    if f1 == f2 or rk1 == rk2:
+        # Check if they can see each other (nothing between)
+        if board.is_attacked_by(color, r1) and r2 in board.attacks(r1):
+            return 15
+
+    return 0
+
+
+# ============================================================
+# King tropism (opponent pieces near our king = danger)
+# ============================================================
+
+def _king_tropism(board: chess.Board, color: bool) -> int:
+    """Penalize when opponent pieces are close to our king."""
+    king_sq = board.king(color)
+    if king_sq is None:
+        return 0
+
+    opponent = not color
+    king_file = chess.square_file(king_sq)
+    king_rank = chess.square_rank(king_sq)
+    score = 0
+
+    for sq in chess.SQUARES:
+        p = board.piece_at(sq)
+        if p is None or p.color != opponent:
+            continue
+        if p.piece_type in (chess.PAWN, chess.KING):
+            continue
+
+        # Chebyshev distance from opponent piece to our king
+        dist = max(abs(chess.square_file(sq) - king_file),
+                   abs(chess.square_rank(sq) - king_rank))
+
+        # Closer = more dangerous (scaled by piece value)
+        if dist <= 3:
+            threat = PIECE_VALUE.get(p.piece_type, 0) // 100
+            score -= (4 - dist) * threat * 3
+
+    return score
+
+
+# ============================================================
 # Checkmate forcing (endgame with major pieces vs lone king)
 # ============================================================
 
@@ -438,8 +543,19 @@ def evaluate(board: chess.Board) -> float:
             elif not own_pawns:
                 score += sign * 15  # Semi-open file
 
-    # 7. Checkmate forcing: when one side has overwhelming material vs lone king,
-    # add bonuses for driving the losing king to the edge and keeping kings close
+    # 7. Knight outposts
+    score += _knight_outposts(board, chess.WHITE)
+    score -= _knight_outposts(board, chess.BLACK)
+
+    # 8. Connected rooks
+    score += _connected_rooks(board, chess.WHITE)
+    score -= _connected_rooks(board, chess.BLACK)
+
+    # 9. King tropism (opponent pieces near king = danger, middlegame only)
+    score += int(_king_tropism(board, chess.WHITE) * mg_weight)
+    score -= int(_king_tropism(board, chess.BLACK) * mg_weight)
+
+    # 10. Checkmate forcing: when one side has overwhelming material vs lone king
     score += _checkmate_forcing(board, chess.WHITE)
     score -= _checkmate_forcing(board, chess.BLACK)
 
@@ -470,6 +586,10 @@ def _back_rank_safety(board: chess.Board, color: bool) -> int:
 
     if king_rank != back_rank:
         return 0  # King not on back rank, no penalty
+
+    # Only relevant after castling (middlegame+), not in opening setup
+    if board.fullmove_number < 8:
+        return 0
 
     king_file = chess.square_file(king_sq)
 
@@ -607,6 +727,10 @@ def _evaluate_raw(board: chess.Board) -> int:
 
     score += _checkmate_forcing(board, chess.WHITE)
     score -= _checkmate_forcing(board, chess.BLACK)
+
+    # Bishop pair (cheap check)
+    if len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2: score += 30
+    if len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2: score -= 30
 
     # Convert to current player's perspective
     if board.turn == chess.BLACK:

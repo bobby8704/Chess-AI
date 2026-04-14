@@ -195,10 +195,13 @@ class StockfishTeacher:
 
 # ==================== Neural Network ====================
 
+CNN_NUM_FILTERS = 128
+CNN_NUM_RES_BLOCKS = 10  # Deeper backbone for better pattern recognition
+
 def load_or_create_model(model_path, device, architecture="cnn"):
     """Load existing model or create new one."""
     if architecture == "cnn":
-        model = DualNetCNN(in_channels=13, num_filters=128, num_res_blocks=6).to(device)
+        model = DualNetCNN(in_channels=13, num_filters=CNN_NUM_FILTERS, num_res_blocks=CNN_NUM_RES_BLOCKS).to(device)
     else:
         model = DualNet(input_dim=781).to(device)
 
