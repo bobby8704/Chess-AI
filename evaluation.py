@@ -625,13 +625,13 @@ def _back_rank_safety(board: chess.Board, color: bool) -> int:
 # Quiescence search
 # ============================================================
 
-def evaluate_quiescence(board: chess.Board, max_depth: int = 6) -> float:
+def evaluate_quiescence(board: chess.Board, max_depth: int = 2) -> float:
     """
     Evaluate a position with quiescence search.
 
-    Extends the evaluation by playing out all captures until the position
-    is "quiet" (no more profitable captures). This prevents the AI from
-    evaluating positions mid-capture-sequence as stable.
+    Extends the evaluation by playing out captures until the position
+    is "quiet" (no more profitable captures). Max depth 3 plies to
+    prevent explosion in complex middlegame positions.
 
     Returns value from current player's perspective in [-1, +1].
     """
@@ -662,6 +662,9 @@ def _quiescence(board: chess.Board, depth: int, alpha: int, beta: int) -> int:
     if stand_pat > alpha:
         alpha = stand_pat
 
+    # Delta pruning margin (skip captures that can't possibly improve alpha)
+    DELTA_MARGIN = 200  # ~2 pawns
+
     # Search only captures (and promotions), ordered by MVV-LVA
     captures = []
     for i, move in enumerate(board.legal_moves):
@@ -669,6 +672,11 @@ def _quiescence(board: chess.Board, depth: int, alpha: int, beta: int) -> int:
             # MVV-LVA: Most Valuable Victim - Least Valuable Attacker
             victim = board.piece_at(move.to_square)
             victim_val = PIECE_VALUE.get(victim.piece_type, 0) if victim else 0
+
+            # Delta pruning: if capturing this piece can't beat alpha, skip
+            if stand_pat + victim_val + DELTA_MARGIN < alpha and not move.promotion:
+                continue
+
             attacker = board.piece_at(move.from_square)
             attacker_val = PIECE_VALUE.get(attacker.piece_type, 0) if attacker else 0
             # Also give bonus for promotions
