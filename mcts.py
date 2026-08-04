@@ -254,6 +254,22 @@ def is_blunder_move(board: chess.Board, move: chess.Move) -> Tuple[bool, float]:
     return False, 0.0
 
 
+# chess.Board.copy() defaults to stack=True, which rebuilds the whole game history
+# ([copy.copy(m) for m in self.move_stack]) on EVERY copy. Measured cost per copy:
+# 2.9us at ply 0, 41.7us at ply 16, 140.3us at ply 60 — so search cost grew with game
+# length, and by move 30 a "hard" move cost twice what the same search cost at move 1.
+#
+# Tree nodes never need the full game history: the search tree is only a few ply deep,
+# so a short window is enough for in-tree repetition detection. The halfmove clock is a
+# plain board field and survives truncation, so fifty/seventy-five-move rules are
+# unaffected — only repetition detection sees a shorter horizon.
+# Set to False to drop history entirely: measured a further 1.13x, but it disables
+# in-tree repetition detection outright. Left at 8 until a strength harness exists to
+# confirm that costs nothing. (The top-level anti-repetition check in
+# MCTSPlayer.select_move runs on the real board and is unaffected either way.)
+TREE_STACK_DEPTH = 8
+
+
 @dataclass
 class MCTSConfig:
     """Configuration for MCTS search."""
@@ -281,14 +297,23 @@ class MCTSNode:
         board: chess.Board,
         parent: Optional['MCTSNode'] = None,
         move: Optional[chess.Move] = None,
-        prior: float = 0.0
+        prior: float = 0.0,
+        own_board: bool = False
     ):
-        self.board = board.copy()
+        # own_board=True means the caller built this board solely for us and will not
+        # touch it again, so we can keep it instead of copying. Nothing in the search
+        # ever leaves a node's board mutated (quiescence pushes and pops in balanced
+        # pairs), so the defensive copy was pure overhead: it made every node cost two
+        # Board.copy() calls instead of one — over 100k copies per 1300-sim move.
+        self.board = board if own_board else board.copy()
         self.parent = parent
         self.move = move  # Move that led to this node
         self.prior = prior  # P(s, a) from policy network
 
         self.children: Dict[chess.Move, 'MCTSNode'] = {}
+        # Policy priors for every legal move, in policy order. Children are created
+        # lazily from this on first selection, so children is a subset of child_priors.
+        self.child_priors: Dict[chess.Move, float] = {}
         self.visit_count: int = 0
         self.value_sum: float = 0.0
         self.is_expanded: bool = False
@@ -332,7 +357,12 @@ class MCTSNode:
 
     def expand(self, move_probs: Dict[chess.Move, float]):
         """
-        Expand this node by creating child nodes for all legal moves.
+        Mark this node expanded and record the policy prior for each legal move.
+
+        Child nodes are NOT built here — they are created on first selection, in
+        select_child. The search only ever reaches a small fraction of them: at 1300
+        simulations the eager version created ~50,600 nodes and evaluated 1,300, so
+        ~97% of its board copies and is_game_over() calls were pure waste.
 
         Args:
             move_probs: Policy network probabilities for each legal move
@@ -340,30 +370,48 @@ class MCTSNode:
         if self.is_expanded or self.is_terminal:
             return
 
-        for move, prob in move_probs.items():
-            child_board = self.board.copy()
-            child_board.push(move)
-            self.children[move] = MCTSNode(
-                board=child_board,
-                parent=self,
-                move=move,
-                prior=prob
-            )
-
+        # Copied so later prior edits (e.g. Dirichlet noise) cannot reach the caller's
+        # dict. Insertion order is preserved and is load-bearing — see select_child.
+        self.child_priors = dict(move_probs)
         self.is_expanded = True
 
     def select_child(self, c_puct: float) -> Tuple[chess.Move, 'MCTSNode']:
-        """Select the child with highest UCB score."""
+        """
+        Select the child with highest UCB score, creating it if it does not exist yet.
+
+        Iterates child_priors rather than children so that not-yet-created moves are
+        still considered. A missing child has by definition never been visited, so it
+        scores float('inf') exactly as a created-but-unvisited node did before — which
+        keeps the old tie-break intact: with several inf scores and a strict `>`, the
+        first move in policy order wins.
+        """
         best_score = float('-inf')
         best_move = None
         best_child = None
 
-        for move, child in self.children.items():
-            score = child.ucb_score(c_puct, self.visit_count)
+        for move in self.child_priors:
+            child = self.children.get(move)
+            score = (float('inf') if child is None
+                     else child.ucb_score(c_puct, self.visit_count))
             if score > best_score:
                 best_score = score
                 best_move = move
                 best_child = child
+
+        if best_move is None:
+            return None, None
+
+        if best_child is None:
+            child_board = self.board.copy(stack=TREE_STACK_DEPTH)
+            child_board.push(best_move)
+            best_child = MCTSNode(
+                board=child_board,
+                parent=self,
+                move=best_move,
+                prior=self.child_priors[best_move],
+                own_board=True
+            )
+            self.children[best_move] = best_child
 
         return best_move, best_child
 
@@ -386,12 +434,18 @@ class MCTSNode:
 
         This encourages exploration during self-play training.
         """
-        if not self.children:
+        if not self.child_priors:
             return
 
-        noise = np.random.dirichlet([alpha] * len(self.children))
-        for i, child in enumerate(self.children.values()):
-            child.prior = (1 - epsilon) * child.prior + epsilon * noise[i]
+        noise = np.random.dirichlet([alpha] * len(self.child_priors))
+        for i, move in enumerate(self.child_priors):
+            noised = (1 - epsilon) * self.child_priors[move] + epsilon * noise[i]
+            self.child_priors[move] = noised
+            # Normally no children exist yet (noise is applied right after expand),
+            # but keep any that do in sync with the priors they were built from.
+            child = self.children.get(move)
+            if child is not None:
+                child.prior = noised
 
 
 class MCTS:
@@ -493,9 +547,12 @@ class MCTS:
             node.backpropagate(value)
 
         # Calculate move probabilities from visit counts
+        # Iterate the priors, not the children: with lazy expansion a move that was
+        # never selected has no node, and it must still appear here with zero visits so
+        # the returned distribution keeps exactly the keys (and order) it always had.
         move_visits = {
-            move: child.visit_count
-            for move, child in root.children.items()
+            move: (root.children[move].visit_count if move in root.children else 0)
+            for move in root.child_priors
         }
 
         total_visits = sum(move_visits.values())
@@ -996,7 +1053,9 @@ class MCTSPlayer:
     def _nn_forward(self, board: chess.Board):
         """Run NN forward pass and return (move_probs_dict, nn_value)."""
         import torch
-        from neural_network import get_legal_move_mask, encode_move, POLICY_OUTPUT_SIZE, is_cnn_model
+        from neural_network import (
+            legal_move_indices, _mask_from_indices, is_cnn_model, get_onnx_session
+        )
 
         if self.model is None:
             legal_moves = list(board.legal_moves)
@@ -1004,22 +1063,40 @@ class MCTSPlayer:
                 return {}, 0.0
             return {m: 1.0 / len(legal_moves) for m in legal_moves}, 0.0
 
+        # One pass over the legal moves gives both the mask indices and the gather
+        # indices. This used to be two passes plus a 4288-element Python write loop.
+        moves, idxs = legal_move_indices(board)
+        if not moves:
+            return {}, 0.0
+
+        # Preferred path: onnxruntime, which is faster than torch at batch size 1.
+        # Softmax is taken over only the legal logits, which is identical to masking
+        # the full 4288-wide vector with -inf and softmaxing that (the illegal entries
+        # contribute exactly zero to the sum) while doing a fraction of the work.
+        session = get_onnx_session() if is_cnn_model(self.model) else None
+        if session is not None:
+            from features import board_to_tensor_2d
+            x = board_to_tensor_2d(board).astype(np.float32, copy=False)[None]
+            logits, nn_value = session.run(x)
+            sel = logits[0][idxs]
+            sel = sel - sel.max()
+            np.exp(sel, out=sel)
+            sel /= sel.sum()
+            return (dict(zip(moves, (float(p) for p in sel))),
+                    float(np.reshape(nn_value, -1)[0]))
+
         if is_cnn_model(self.model):
             from features import board_to_tensor_2d
             x = torch.from_numpy(board_to_tensor_2d(board)).float().to(self.device).unsqueeze(0)
         else:
             x = torch.from_numpy(board_to_tensor(board)).float().to(self.device).unsqueeze(0)
-        mask = get_legal_move_mask(board).to(self.device).unsqueeze(0)
+        mask = _mask_from_indices(idxs).to(self.device).unsqueeze(0)
 
         with torch.no_grad():
             policy_probs, nn_value = self.model.get_policy_value(x, mask)
 
         policy_probs = policy_probs.squeeze(0).cpu().numpy()
-        move_probs = {}
-        for move in board.legal_moves:
-            idx = encode_move(move)
-            if idx < POLICY_OUTPUT_SIZE:
-                move_probs[move] = float(policy_probs[idx])
+        move_probs = dict(zip(moves, (float(p) for p in policy_probs[idxs])))
 
         return move_probs, nn_value.item()
 

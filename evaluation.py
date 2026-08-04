@@ -644,10 +644,18 @@ def _quiescence(board: chess.Board, depth: int, alpha: int, beta: int) -> int:
     Only searches capture moves to resolve tactical instability.
     Uses alpha-beta pruning for efficiency.
     """
-    if board.is_checkmate():
-        return -30000
+    # is_checkmate() and is_stalemate() each walk the full legal move generator, and
+    # this runs at every quiescence node. Generate once and derive both, which is
+    # identical by python-chess's own definitions:
+    #   is_checkmate() == is_check() and not any(legal moves)
+    #   is_stalemate() == not is_check() and not any(legal moves)   [standard chess]
+    in_check = board.is_check()
+    has_legal = any(board.generate_legal_moves())
 
-    if board.is_stalemate() or board.is_insufficient_material() or board.can_claim_draw():
+    if not has_legal:
+        return -30000 if in_check else 0
+
+    if board.is_insufficient_material() or board.can_claim_draw():
         return 0
 
     # Standing pat: evaluate the position statically

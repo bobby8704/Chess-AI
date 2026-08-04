@@ -5,10 +5,21 @@ Serves a web interface where users can play against the chess AI.
 Uses the MCTS engine with the trained dual neural network.
 """
 
+import os
 import uuid
 import time
 import chess
+import torch
 from flask import Flask, jsonify, request, render_template, send_from_directory
+
+# Pin torch's intra-op thread pool before anything runs a forward pass. The default is
+# one thread per core (14 on this machine), which is pathological for a single
+# 1x13x8x8 convolution — splitting work that small costs more than doing it, and it
+# produced a measured 4-15x latency tail on individual forwards. 4 threads measured
+# faster overall and leaves the remaining cores to python-chess, which is where most
+# of a move is actually spent. Oversubscription is worse, not better, on a small
+# web host, so this matters more in production than it does locally.
+torch.set_num_threads(int(os.environ.get("CHESS_TORCH_THREADS", "4")))
 
 from neural_network import load_dual_model
 from mcts import MCTSPlayer, MCTSConfig

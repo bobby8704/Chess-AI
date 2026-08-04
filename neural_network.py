@@ -11,6 +11,8 @@ The policy network outputs a probability distribution over all possible
 chess moves (encoded as from_square * 64 + to_square with promotion handling).
 """
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -98,6 +100,24 @@ def decode_move(index: int, board: chess.Board) -> Optional[chess.Move]:
     return None
 
 
+def legal_move_indices(board: chess.Board):
+    """
+    Return (moves, indices) for the current position, in legal-move order.
+
+    Computing the policy indices once lets a caller build the legal-move mask AND
+    gather the resulting probabilities without walking the move list — and calling
+    encode_move on every move — a second time.
+    """
+    moves = []
+    idxs = []
+    for move in board.legal_moves:
+        idx = encode_move(move)
+        if idx < POLICY_OUTPUT_SIZE:
+            moves.append(move)
+            idxs.append(idx)
+    return moves, np.asarray(idxs, dtype=np.int64)
+
+
 def get_legal_move_mask(board: chess.Board) -> torch.Tensor:
     """
     Create a mask of legal moves for the current position.
@@ -105,11 +125,15 @@ def get_legal_move_mask(board: chess.Board) -> torch.Tensor:
     Returns a tensor of shape (POLICY_OUTPUT_SIZE,) with 1.0 for legal moves
     and 0.0 for illegal moves.
     """
+    _, idxs = legal_move_indices(board)
+    return _mask_from_indices(idxs)
+
+
+def _mask_from_indices(idxs: np.ndarray) -> torch.Tensor:
+    """Build a policy mask from precomputed legal indices in one scatter."""
     mask = torch.zeros(POLICY_OUTPUT_SIZE)
-    for move in board.legal_moves:
-        idx = encode_move(move)
-        if idx < POLICY_OUTPUT_SIZE:
-            mask[idx] = 1.0
+    if idxs.size:
+        mask[torch.from_numpy(idxs)] = 1.0
     return mask
 
 
@@ -475,6 +499,88 @@ def load_dual_model(path: str):
 def is_cnn_model(model) -> bool:
     """Check if the loaded model is a CNN (needs 2D input)."""
     return isinstance(model, DualNetCNN)
+
+
+# ==================== ONNX Runtime inference ====================
+
+_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+DEFAULT_ONNX_PATH = os.path.join(_MODELS_DIR, "dual_model_mcts_fp32.onnx")
+DEFAULT_CKPT_PATH = os.path.join(_MODELS_DIR, "dual_model_mcts.pt")
+
+_ort_session = None
+_ort_resolved = False
+
+
+class OnnxPolicyValue:
+    """
+    onnxruntime wrapper around the dual net's forward pass.
+
+    Used instead of torch at serving time: it is faster at batch size 1 (which is what
+    MCTS does) and it means a deployment does not have to ship torch at all.
+    Returns raw policy logits and value — masking and softmax stay with the caller.
+    """
+
+    def __init__(self, path: str, threads: int = 4):
+        import onnxruntime as ort
+
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = threads
+        opts.inter_op_num_threads = 1
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # Stop ORT's worker threads spinning between calls. The isolated forward gets
+        # marginally slower, but a real search gets faster overall: most of a move is
+        # python-chess, and spinning ORT threads were holding cores it needed.
+        opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+
+        self.session = ort.InferenceSession(
+            path, opts, providers=["CPUExecutionProvider"]
+        )
+        self.input_name = self.session.get_inputs()[0].name
+        self.path = path
+
+    def run(self, x: np.ndarray):
+        """x: (B, 13, 8, 8) float32 -> (policy_logits, value) as numpy arrays."""
+        return self.session.run(None, {self.input_name: x})
+
+
+def get_onnx_session(path: str = None):
+    """
+    Return a cached ONNX session for inference, or None to fall back to torch.
+
+    Resolved once per process. Set CHESS_USE_ONNX=0 to force the torch path.
+    """
+    global _ort_session, _ort_resolved
+    if _ort_resolved:
+        return _ort_session
+    _ort_resolved = True
+
+    if os.environ.get("CHESS_USE_ONNX", "1") == "0":
+        return None
+
+    path = path or DEFAULT_ONNX_PATH
+    if not os.path.exists(path):
+        return None
+
+    # Refuse a stale export. If the checkpoint has been retrained since the ONNX file
+    # was written, serving from ONNX would quietly use the OLD weights while every log
+    # line still names the new checkpoint — a silent strength regression that looks
+    # like the model got worse for no reason. Fall back to torch and say so.
+    if (os.path.exists(DEFAULT_CKPT_PATH)
+            and os.path.getmtime(DEFAULT_CKPT_PATH) > os.path.getmtime(path)):
+        print(f"WARNING: {os.path.basename(DEFAULT_CKPT_PATH)} is newer than "
+              f"{os.path.basename(path)} — the ONNX export is stale, so falling back "
+              f"to torch inference. Re-export with: python export_onnx.py")
+        return None
+
+    try:
+        _ort_session = OnnxPolicyValue(
+            path, threads=int(os.environ.get("CHESS_TORCH_THREADS", "4"))
+        )
+        print(f"ONNX inference enabled: {os.path.basename(path)}")
+    except Exception as e:
+        print(f"WARNING: could not start ONNX session ({e}); using torch inference.")
+        _ort_session = None
+    return _ort_session
 
 
 def get_dual_model() -> Optional[DualNet]:

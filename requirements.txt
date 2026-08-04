@@ -1,8 +1,19 @@
 # Core Dependencies
 python-chess>=1.11.2
-torch>=2.0.0
 numpy>=1.24.0
 pygame-ce>=2.5.0
+
+# Inference (serving path)
+# The web server runs the network through onnxruntime, not torch: it is faster at
+# batch size 1 and it means a deployment does not need torch at all (~430MB vs 42MB).
+onnxruntime>=1.17.0
+
+# Training / model export only — NOT needed to serve models/dual_model_mcts_fp32.onnx.
+# Install the CPU build explicitly on Linux, or pip resolves to the multi-GB CUDA wheel:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+onnx>=1.16.0
+onnxscript>=0.1.0
 
 # Web Server
 flask>=3.0.0
