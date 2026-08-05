@@ -412,9 +412,12 @@ class MCTSNode:
         self.value is stored from THIS node's perspective (the opponent of the parent),
         so it is negated — the parent maximises its own value, not the opponent's.
 
-        An unvisited child scores Q = 0 (the `value` property returns 0.0 at zero
-        visits), which is the standard AlphaZero first-play-urgency: an unexplored move
-        is treated as neutral, and its prior alone decides how urgently it gets tried.
+        Note this method is never actually reached with visit_count == 0: select_child
+        creates a child and the simulation immediately backpropagates through it, so
+        every existing node has at least one visit. First-play-urgency for a move with
+        no node yet is applied by the inline term in select_child, which uses the same
+        formula (Q = 0, N = 0). The zero-visit case is kept correct here anyway so the
+        two paths cannot drift apart.
 
         This used to return float('inf') for any unvisited child, which forced the
         search to visit EVERY sibling once before a prior could matter. Measured: in a

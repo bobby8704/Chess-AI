@@ -291,6 +291,26 @@ def build(n_games, per_game, want_mate, workers, seed=20260805):
               f"{max(e['n_legal'] for e in positions)}")
 
 
+def sample(positions, limit):
+    """
+    Take an evenly-spaced sample across the suite — NOT a prefix.
+
+    This is not a stylistic preference. build() sorts the suite by move-stack length for
+    determinism, so positions[:400] is ply 12-18 out of a suite spanning ply 12-68: an
+    early-game slice masquerading as a sample. The measured consequence was severe — the
+    PUCT change reads -7.58 cp (p=0.12, NOT significant) on positions[:400] but -11.35 cp
+    (p=0.0065) on the remaining 1074. The default --limit recipe could not detect the
+    best-evidenced result in the project, and every c_puct and FPU null measured on it
+    means "unmeasured", not "no effect".
+
+    Deterministic, so two arms with the same --limit compare on identical positions.
+    """
+    if not limit or limit >= len(positions):
+        return positions
+    step = len(positions) / limit
+    return [positions[int(i * step)] for i in range(limit)]
+
+
 def load_suite(name):
     path = os.path.join(SUITE_DIR, f"{name}.json")
     if not os.path.exists(path):
@@ -426,9 +446,9 @@ def build_walkinto_entries(limit=None):
         if safe:
             out.append({"name": e["name"], "moves": e["moves"][:-1],
                         "fen": board.fen()})
-        if limit and len(out) >= limit:
-            break
-    return out
+    # Sample AFTER building the full list rather than breaking early, so --limit spans
+    # the whole suite instead of taking its early-game prefix. See sample().
+    return sample(out, limit)
 
 
 def _walkinto_one(entry):
@@ -492,7 +512,7 @@ def n_for_delta(sd, delta, power=0.80, alpha=0.05):
 
 def cmd_run(label, sims, workers, threads, limit, uniform=False):
     suite = load_suite("acpl")
-    entries = suite["positions"][:limit] if limit else suite["positions"]
+    entries = sample(suite["positions"], limit)
     print(f"ACPL run '{label}': {len(entries)} positions, {sims} sims, "
           f"{workers} workers x {threads} thread(s), Stockfish depth {suite['ref_depth']}"
           + ("   [UNIFORM CONTROL: no network]" if uniform else ""))
@@ -533,7 +553,7 @@ def cmd_run(label, sims, workers, threads, limit, uniform=False):
 
 def cmd_mate(label, sims, workers, threads, limit):
     suite = load_suite("mate1")
-    entries = suite["positions"][:limit] if limit else suite["positions"]
+    entries = sample(suite["positions"], limit)
     if not entries:
         raise SystemExit("mate suite is empty — rebuild with --mate")
     print(f"Mate-in-1 '{label}': {len(entries)} positions, {sims} sims")

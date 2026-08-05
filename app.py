@@ -40,11 +40,35 @@ app = Flask(__name__)
 # Load the trained model once at startup
 MODEL_PATH = "models/dual_model_mcts.pt"
 
-# Difficulty presets: name -> simulations
+# Difficulty presets: name -> simulations.
+#
+# Recalibrated from measurement (bench/strength.py). Single-request latency on an idle
+# box through this exact serving path (ONNX fp32, CHESS_NUM_THREADS=4, fresh player per
+# move), median / p90 / CPU-seconds:
+#
+#     100 sims   518 /  662 ms   1.1 s CPU      <- easy
+#     300 sims  1544 / 1847 ms   3.0 s CPU      <- medium
+#     600 sims  3203 / 4196 ms   6.3 s CPU      <- hard
+#    1300 sims  7033 / 8681 ms  14.3 s CPU      <- the OLD hard tier
+#
+# Dropping hard from 1300 to 600 is free strength-wise: 1300 sims measured +0.17 cp
+# against 600 (95% CI [-8.31, +8.66], 98/400 moves differ, so a live comparison rather
+# than a tie) while costing 2.2x the latency and 2.3x the CPU. 600 is the knee of the
+# ACPL-vs-simulations curve. On a single core the old tier cost 17.8 s per move.
+#
+# Dropping medium to 300 is NOT free: it costs a measured ~10 cp (p=0.034 on ply 18-25,
+# corroborated by a +6.24 cp full-suite 200-vs-600 contrast, p=0.0146). That is
+# deliberate — it is the only rung on this ladder that measurably changes strength.
+#
+# Honest caveat: 100/200/300 sims are mutually indistinguishable on strength, so easy
+# and medium differ mainly in latency. Making easy genuinely weaker needs a mechanism
+# that measurably degrades play (root temperature > 0 or top-k sampling), not fewer
+# simulations. Safety is unaffected across the range: mate-in-1 300/300 at 50, 100, 300
+# and 600 sims; walk-into-mate 0/200 at both 50 and 600.
 DIFFICULTY_PRESETS = {
-    "easy": 200,
-    "medium": 600,
-    "hard": 1300,
+    "easy": 100,
+    "medium": 300,
+    "hard": 600,
 }
 
 print("Loading chess AI model...")
