@@ -1032,14 +1032,18 @@ class MCTSPlayer:
             config: MCTS configuration
             device: PyTorch device
         """
-        import torch
         self.model = model
         self.config = config or MCTSConfig()
-        self.device = device or torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        self.device = device
 
+        # torch is imported only when there is actually a torch model to place. With
+        # ONNX inference and no checkpoint, the serving path never needs it.
         if model is not None:
+            import torch
+            if self.device is None:
+                self.device = torch.device(
+                    "cuda" if torch.cuda.is_available() else "cpu"
+                )
             model.to(self.device)
             model.eval()
 
@@ -1052,12 +1056,17 @@ class MCTSPlayer:
 
     def _nn_forward(self, board: chess.Board):
         """Run NN forward pass and return (move_probs_dict, nn_value)."""
-        import torch
         from neural_network import (
             legal_move_indices, _mask_from_indices, is_cnn_model, get_onnx_session
         )
 
-        if self.model is None:
+        # Resolve ONNX BEFORE looking at self.model. A deployment can ship only the
+        # exported .onnx and no torch checkpoint, in which case self.model is None but
+        # we still have real weights — checking self.model first would silently answer
+        # every position with a uniform random policy while looking perfectly healthy.
+        session = get_onnx_session()
+
+        if session is None and self.model is None:
             legal_moves = list(board.legal_moves)
             if not legal_moves:
                 return {}, 0.0
@@ -1073,8 +1082,9 @@ class MCTSPlayer:
         # Softmax is taken over only the legal logits, which is identical to masking
         # the full 4288-wide vector with -inf and softmaxing that (the illegal entries
         # contribute exactly zero to the sum) while doing a fraction of the work.
-        session = get_onnx_session() if is_cnn_model(self.model) else None
-        if session is not None:
+        # The export is of the CNN, so use it when there is no torch model at all, or
+        # when the torch model is the CNN architecture it was exported from.
+        if session is not None and (self.model is None or is_cnn_model(self.model)):
             from features import board_to_tensor_2d
             x = board_to_tensor_2d(board).astype(np.float32, copy=False)[None]
             logits, nn_value = session.run(x)
@@ -1085,6 +1095,7 @@ class MCTSPlayer:
             return (dict(zip(moves, (float(p) for p in sel))),
                     float(np.reshape(nn_value, -1)[0]))
 
+        import torch
         if is_cnn_model(self.model):
             from features import board_to_tensor_2d
             x = torch.from_numpy(board_to_tensor_2d(board)).float().to(self.device).unsqueeze(0)

@@ -21,7 +21,7 @@ from flask import Flask, jsonify, request, render_template, send_from_directory
 # web host, so this matters more in production than it does locally.
 torch.set_num_threads(int(os.environ.get("CHESS_TORCH_THREADS", "4")))
 
-from neural_network import load_dual_model
+from neural_network import load_dual_model, get_onnx_session, DEFAULT_ONNX_PATH
 from mcts import MCTSPlayer, MCTSConfig
 from evaluation import evaluate as hc_evaluate
 
@@ -42,12 +42,29 @@ DIFFICULTY_PRESETS = {
 }
 
 print("Loading chess AI model...")
+
+# Inference runs from the exported ONNX; the torch checkpoint is optional and only
+# needed for training and re-export. Either alone is enough to serve real moves.
+dual_model = None
 try:
     dual_model = load_dual_model(MODEL_PATH)
-    print(f"Model loaded: {MODEL_PATH}")
+    print(f"Torch checkpoint loaded: {MODEL_PATH}")
 except Exception as e:
-    print(f"WARNING: Could not load model ({e}). AI will use uniform policy.")
-    dual_model = None
+    print(f"No torch checkpoint ({e}) - fine if the ONNX export is present.")
+
+_inference_session = get_onnx_session()
+if _inference_session is not None:
+    print(f"Serving inference from {os.path.basename(_inference_session.path)}")
+elif dual_model is None:
+    # Refuse to start rather than come up healthy and answer every position with a
+    # uniform random move. This used to be a printed warning nobody would ever see:
+    # every route returned 200 while the AI played garbage.
+    raise SystemExit(
+        "FATAL: no usable model found. Expected one of:\n"
+        f"  {DEFAULT_ONNX_PATH}   (inference - run: python export_onnx.py)\n"
+        f"  {os.path.abspath(MODEL_PATH)}   (torch checkpoint)\n"
+        "Refusing to start, because serving random moves looks identical to working."
+    )
 
 
 def _make_player(num_sims: int) -> MCTSPlayer:

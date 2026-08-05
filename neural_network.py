@@ -568,7 +568,7 @@ def get_onnx_session(path: str = None):
     if (os.path.exists(DEFAULT_CKPT_PATH)
             and os.path.getmtime(DEFAULT_CKPT_PATH) > os.path.getmtime(path)):
         print(f"WARNING: {os.path.basename(DEFAULT_CKPT_PATH)} is newer than "
-              f"{os.path.basename(path)} — the ONNX export is stale, so falling back "
+              f"{os.path.basename(path)} - the ONNX export is stale, so falling back "
               f"to torch inference. Re-export with: python export_onnx.py")
         return None
 

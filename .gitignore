@@ -32,11 +32,11 @@ data/datasets/
 # Benchmark results (machine-specific timings, regenerate with bench/verify.py)
 bench/results/
 
-# Exported inference model. NOTE: this is the artifact the web server actually serves.
-# Leaving it ignored means a clone-based deploy has no weights at all and silently
-# falls back to a uniform (random) policy. Consider committing it — it is ~18MB, well
-# inside GitHub's limits — or fetching it in the deploy step.
-models/*.onnx
+# NOTE: models/dual_model_mcts_fp32.onnx is deliberately TRACKED, not ignored. It is
+# the artifact the web server actually serves, and keeping it in the repo is what makes
+# a clone-based deploy work — see bench/test_deploy.py. Torch checkpoints (*.pt) stay
+# ignored: they are training artifacts, and the .onnx is regenerated from them by
+# export_onnx.py.
 models/*.onnx.data
 
 # Stockfish binary (too large for git)
