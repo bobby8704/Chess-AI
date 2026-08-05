@@ -30,6 +30,18 @@ PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
 FOREIGN_CWD = os.path.expanduser("~")
 
+# Makes `import torch` fail, so we can prove the serving path never needs it.
+BLOCK_TORCH = r'''
+import sys
+from importlib.abc import MetaPathFinder
+class _BlockTorch(MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "torch" or fullname.startswith("torch."):
+            raise ImportError("torch is blocked by test_deploy.py")
+        return None
+sys.meta_path.insert(0, _BlockTorch())
+'''
+
 PROBE = r'''
 import sys, chess
 sys.path.insert(0, r"{proj}")
@@ -44,16 +56,17 @@ ai = [h for h in j["history"] if h["color"] == "black"]
 print("RESULT",
       "torch" if A.dual_model is not None else "no-torch",
       "onnx" if A._inference_session is not None else "no-onnx",
-      ai[-1]["san"])
+      ai[-1]["san"],
+      "torch-imported" if "torch" in sys.modules else "torch-absent")
 '''.format(proj=PROJ)
 
 
-def run(cwd, env_extra=None):
+def run(cwd, env_extra=None, prelude=""):
     env = dict(os.environ)
     env.pop("CHESS_USE_ONNX", None)
     if env_extra:
         env.update(env_extra)
-    r = subprocess.run([PY, "-c", PROBE], cwd=cwd, env=env,
+    r = subprocess.run([PY, "-c", prelude + PROBE], cwd=cwd, env=env,
                        capture_output=True, text=True)
     line = next((l for l in r.stdout.splitlines() if l.startswith("RESULT")), None)
     return r.returncode, (line.split()[1:] if line else None), r.stdout + r.stderr
@@ -85,6 +98,17 @@ def main():
     check("refuses to start", code_c != 0, f"exit {code_c}")
     check("does not serve a move", res_c is None)
     check("explains what is missing", "FATAL: no usable model" in log_c)
+
+    print("\nD. torch not installed at all (the real deployment shape)")
+    code_d, res_d, log_d = run(PROJ, prelude=BLOCK_TORCH)
+    check("serves without torch", code_d == 0 and res_d is not None,
+          f"exit {code_d}" + ("" if res_d else " / " + log_d.strip().splitlines()[-1:][0]
+                              if log_d.strip() else ""))
+    check("torch never entered sys.modules",
+          bool(res_d) and res_d[3] == "torch-absent", str(res_d))
+    check("plays the SAME move as case A", bool(res_a) and bool(res_d)
+          and res_a[2] == res_d[2],
+          f"A={res_a[2] if res_a else '?'} D={res_d[2] if res_d else '?'}")
 
     print("\n" + "=" * 60)
     if failures:

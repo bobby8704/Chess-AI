@@ -1,3 +1,9 @@
+# FULL development environment: engine + training + model export + the pygame client.
+#
+# To DEPLOY the web app, use requirements-serve.txt instead. It omits torch and comes
+# out at 115MB installed against this file's 976MB, because inference runs from the
+# ONNX export rather than torch.
+
 # Core Dependencies
 python-chess>=1.11.2
 numpy>=1.24.0

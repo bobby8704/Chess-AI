@@ -1056,9 +1056,8 @@ class MCTSPlayer:
 
     def _nn_forward(self, board: chess.Board):
         """Run NN forward pass and return (move_probs_dict, nn_value)."""
-        from neural_network import (
-            legal_move_indices, _mask_from_indices, is_cnn_model, get_onnx_session
-        )
+        # inference is the torch-free module; importing it must not pull torch in.
+        from inference import legal_move_indices, get_onnx_session
 
         # Resolve ONNX BEFORE looking at self.model. A deployment can ship only the
         # exported .onnx and no torch checkpoint, in which case self.model is None but
@@ -1078,13 +1077,20 @@ class MCTSPlayer:
         if not moves:
             return {}, 0.0
 
+        # The export is of the CNN, so use ONNX when there is no torch model at all, or
+        # when the torch model is the CNN architecture it was exported from. is_cnn_model
+        # compares against a torch class, so only consult it once a torch model exists —
+        # otherwise a torch-free deployment would import torch just to answer this.
+        use_onnx = session is not None
+        if use_onnx and self.model is not None:
+            from neural_network import is_cnn_model
+            use_onnx = is_cnn_model(self.model)
+
         # Preferred path: onnxruntime, which is faster than torch at batch size 1.
         # Softmax is taken over only the legal logits, which is identical to masking
         # the full 4288-wide vector with -inf and softmaxing that (the illegal entries
         # contribute exactly zero to the sum) while doing a fraction of the work.
-        # The export is of the CNN, so use it when there is no torch model at all, or
-        # when the torch model is the CNN architecture it was exported from.
-        if session is not None and (self.model is None or is_cnn_model(self.model)):
+        if use_onnx:
             from features import board_to_tensor_2d
             x = board_to_tensor_2d(board).astype(np.float32, copy=False)[None]
             logits, nn_value = session.run(x)
@@ -1096,6 +1102,7 @@ class MCTSPlayer:
                     float(np.reshape(nn_value, -1)[0]))
 
         import torch
+        from neural_network import _mask_from_indices, is_cnn_model
         if is_cnn_model(self.model):
             from features import board_to_tensor_2d
             x = torch.from_numpy(board_to_tensor_2d(board)).float().to(self.device).unsqueeze(0)

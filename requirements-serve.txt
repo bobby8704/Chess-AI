@@ -1,0 +1,19 @@
+# Serving-only dependencies for the web app.
+#
+# This is what a deployment needs — NOT requirements.txt, which additionally pulls in
+# torch (~433MB) for training and model export. Inference runs from
+# models/dual_model_mcts_fp32.onnx through onnxruntime, and nothing on the request
+# path imports torch (proved by bench/test_deploy.py, case D).
+#
+#   pip install -r requirements-serve.txt
+#
+# Verify the deployment can actually serve before shipping:
+#   python bench/test_deploy.py
+
+python-chess>=1.11.2
+numpy>=1.24.0
+onnxruntime>=1.17.0
+flask>=3.0.0
+
+# Production WSGI server — do not serve with Flask's development server.
+waitress>=3.0.0
