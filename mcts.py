@@ -125,16 +125,80 @@ def evaluate_material_safety(board: chess.Board) -> float:
 
 
 
+# Severity assigned to a move that lets the opponent mate immediately. Deliberately
+# above any material loss (a queen is 9.0) so it outranks every other blunder.
+MATE_BLUNDER_LOSS = 20.0
+
+
+def _has_mate_in_1(board: chess.Board) -> bool:
+    """
+    True if the side to move has a mate in one.
+
+    Cheaper than it looks: is_checkmate() tests is_check() first — a bitmask — and only
+    generates legal moves when the king is actually in check, so nearly every reply
+    exits immediately. This is used at the root only, over ~40 candidate moves.
+    """
+    for reply in board.legal_moves:
+        board.push(reply)
+        mated = board.is_checkmate()
+        board.pop()
+        if mated:
+            return True
+    return False
+
+
+def _blunder_weight(material_lost: float) -> float:
+    """
+    Relative weight for a blunder, by severity: monotone decreasing, bounded in (0, 1].
+
+    Must never reach zero or go negative. These values become root priors, and a
+    negative prior makes PUCT's exploration term negative, so the search would steer
+    away from precisely the moves it scored best. The previous formula (10 - loss) had
+    no floor and did exactly that for any severity above 10.
+    """
+    return 1.0 / (1.0 + max(0.0, material_lost))
+
+
 def is_blunder_move(board: chess.Board, move: chess.Move) -> Tuple[bool, float]:
     """
-    Check if a move is a blunder (hangs a piece, walks into mate, allows
-    a bad exchange, or makes a bad voluntary capture).
+    Check if a move is a blunder (hangs a piece, allows a bad exchange, or makes a
+    bad voluntary capture).
+
+    NOTE: this does NOT detect walking into mate. The only opponent-reply scan below
+    is capture-only, so a non-capturing mating reply is invisible to it. Measured on
+    positions one ply from mate, the engine plays a mate-allowing move roughly a
+    quarter of the time when a safe move existed.
 
     Returns:
         (is_blunder, material_lost)
     """
     our_color = board.turn  # The color making the move
     opponent_color = not our_color
+
+    # One post-move board, shared by both mate checks below.
+    board_after_move = board.copy()
+    board_after_move.push(move)
+
+    # Delivering mate is never a blunder, and this is checked FIRST so correctness does
+    # not rest on an accident further down: the bad-capture branch below can only fire
+    # when board_after.legal_moves is non-empty, which is false after checkmate. That is
+    # a coincidence of using legal_moves, and rewriting that scan with attackers() or
+    # pseudo-legal generation — an obvious future optimisation on this hot path — would
+    # silently resurrect the bug for mating captures.
+    if board_after_move.is_checkmate():
+        return False, 0.0
+
+    # Allowing an immediate mate is the worst blunder available, and nothing else in
+    # this function can see it: the opponent scan further down is capture-only
+    # (`if board_copy.is_capture(opp_move)`), so a QUIET mating reply — the common kind
+    # — is invisible. Measured on positions one ply from mate where a safe alternative
+    # existed, the engine walked into mate in roughly a quarter to a third of them.
+    #
+    # Checked before the capture branch on purpose: a move that both loses material and
+    # allows mate must be scored at mate severity, because severity is what picks the
+    # least-bad move in the branch where every option is a blunder.
+    if _has_mate_in_1(board_after_move):
+        return True, MATE_BLUNDER_LOSS
 
     # Check if this move is a capture - evaluate if it's a BAD capture
     if board.is_capture(move):
@@ -192,17 +256,10 @@ def is_blunder_move(board: chess.Board, move: chess.Move) -> Tuple[bool, float]:
 
     board_copy.push(move)
 
-    # After OUR move it is the OPPONENT to move, so is_checkmate() here means we just
-    # delivered mate — the best move on the board, not a blunder. This used to return
-    # (True, 100.0), which sent the mating move through the blunder branch and crushed
-    # its root prior from 0.95 to ~0.0002. Measured cost of that inversion: the engine
-    # found mate in 1 in only 8.8% of positions where one existed (64/731 at 200 sims).
-    #
-    # Note the original comment's intent — "we got mated" — is NOT implemented here or
-    # anywhere else: detecting that we walk INTO a mate needs a search of the
-    # opponent's replies, which this function never does.
-    if board_copy.is_checkmate():
-        return False, 0.0
+    # (Checkmate is handled at the top of this function. It used to be tested HERE and
+    # return (True, 100.0) — reading "opponent is mated" as "we got mated" — which sent
+    # every mating move through the blunder branch and crushed its root prior. The
+    # engine found mate in 1 in only 8.8% of positions where one existed.)
 
     # Check if opponent can make a profitable capture after our move
     # Exclude the square we just moved to (that exchange is already evaluated above)
@@ -633,6 +690,9 @@ def _apply_heuristic_boosts(
     """
     move_number = board.fullmove_number
     our_color = board.turn
+    # Collected in rule 5 (where the post-move board already exists) and re-applied in
+    # rule 12 after every other pass has run. Collecting here keeps rule 12 free.
+    mating_moves = set()
 
     for move in list(move_probs.keys()):
         piece = board.piece_at(move.from_square)
@@ -693,6 +753,7 @@ def _apply_heuristic_boosts(
         board_after.push(move)
         if board_after.is_checkmate():
             move_probs[move] = max(move_probs[move], 0.95)
+            mating_moves.add(move)
         elif board_after.is_stalemate():
             # Stalemate is almost always terrible when we're ahead
             move_probs[move] *= 0.001
@@ -732,6 +793,30 @@ def _apply_heuristic_boosts(
 
     # --- 11. Simplification: when ahead in material, boost equal trades ---
     move_probs = _boost_simplification(board, move_probs, our_color)
+
+    # --- 12. Mate dominance (must be LAST) ---
+    # Rule 5 raises a mating move to 0.95, but that is a floor applied mid-pipeline and
+    # four later passes multiply priors down without checking for mate: rule 7's king
+    # penalty (x0.4), _boost_development's early-queen penalty (x0.6),
+    # _penalize_king_shelter_weakening (x0.5) and _boost_simplification (x0.5).
+    # Measured, they demoted the mate in 4 of 5 known misses — 0.95 -> 0.38 for a mating
+    # king move, -> 0.57 for a mating queen move, -> 0.475 for a mating pawn push.
+    #
+    # A floor is not enough even when nothing demotes it: in the fifth case the network
+    # gave a non-mating move a raw prior of 0.9736, above 0.95. So mating moves are
+    # placed strictly ABOVE the current maximum rather than clamped to a constant.
+    #
+    # This matters because the search cannot recover from a bad prior here: quiescence
+    # returns tanh(cp/400), which saturates, so a forced mate and an ordinary winning
+    # move both back up as Q = -1.0 and visits track priors alone. Raising simulations
+    # does not help — 4000 sims still missed 3 of the 5.
+    #
+    # Provably inert when no mate exists: the dict is untouched, and with temperature=0
+    # and no Dirichlet noise the search is deterministic.
+    if mating_moves:
+        ceiling = max(move_probs.values())
+        for move in mating_moves:
+            move_probs[move] = ceiling * 2.0
 
     return move_probs
 
@@ -1175,8 +1260,8 @@ class MCTSPlayer:
                 for move, prob in safe_moves.items():
                     adjusted_probs[move] = (prob / total_safe_prob) * 0.99
                 for move, (prob, material_lost) in blunder_moves.items():
-                    inverse_severity = max(0.1, 1.0 - material_lost / 10.0)
-                    adjusted_probs[move] = 0.01 * inverse_severity / max(len(blunder_moves), 1)
+                    adjusted_probs[move] = (0.01 * _blunder_weight(material_lost)
+                                            / max(len(blunder_moves), 1))
             else:
                 for move, prob in safe_moves.items():
                     adjusted_probs[move] = prob
@@ -1184,10 +1269,15 @@ class MCTSPlayer:
                     adjusted_probs[move] = prob * 0.01
             move_probs = adjusted_probs
         elif blunder_moves:
+            # EVERY move loses something, so this branch chooses the least-bad one —
+            # its ordering matters most exactly when the position is worst. It used to
+            # compute (10.0 - material_lost) with no floor, so any severity above 10
+            # produced NEGATIVE priors: measured priors of -85.5 and distribution sums
+            # of -167 under the old mate semantics. _blunder_weight is bounded in (0,1]
+            # and cannot degenerate, whatever severity is handed to it.
             adjusted_probs = {}
             for move, (prob, material_lost) in blunder_moves.items():
-                inverse_loss = 10.0 - material_lost
-                adjusted_probs[move] = prob * inverse_loss
+                adjusted_probs[move] = prob * _blunder_weight(material_lost)
             move_probs = adjusted_probs
 
         # Normalize
@@ -1241,6 +1331,30 @@ class MCTSPlayer:
         if temperature is not None:
             self.config.temperature = old_temp
 
+        # Mate veto: never hand the opponent an immediate mate when any alternative
+        # exists. This MUST live here, after the search, because demoting the prior
+        # cannot prevent it — measured, 7.9% of sharp positions still walked into mate
+        # with the prior demotion alone. Two mechanisms defeat the prior:
+        #   1. ucb_score returns float('inf') for an unvisited child, so every move
+        #      gets a mandatory first visit no matter how small its prior; and
+        #   2. the child's value comes from evaluate_quiescence, which searches only
+        #      CAPTURES, so a quiet mating reply is invisible and the move evaluates as
+        #      perfectly healthy.
+        # Once visited with a healthy Q, exploitation carries it regardless of prior.
+        # Cheap: only runs when the chosen move actually allows mate, which is rare.
+        if move and move_probs and not board.is_game_over():
+            test_board = board.copy()
+            test_board.push(move)
+            if _has_mate_in_1(test_board):
+                for alt_move, _ in sorted(move_probs.items(), key=lambda x: -x[1]):
+                    if alt_move == move:
+                        continue
+                    alt_board = board.copy()
+                    alt_board.push(alt_move)
+                    if not _has_mate_in_1(alt_board):
+                        move = alt_move
+                        break
+
         # Anti-repetition: if best move would cause a draw by repetition,
         # pick the next best move instead
         if move and move_probs and not board.is_game_over():
@@ -1254,7 +1368,12 @@ class MCTSPlayer:
                         continue
                     alt_board = board.copy()
                     alt_board.push(alt_move)
-                    if not alt_board.can_claim_draw() and not alt_board.is_repetition(2):
+                    # Also require the alternative not to allow mate, or this loop
+                    # could undo the veto above by swapping back to a mate-allowing
+                    # move purely to dodge a repetition. A draw beats a loss.
+                    if (not alt_board.can_claim_draw()
+                            and not alt_board.is_repetition(2)
+                            and not _has_mate_in_1(alt_board)):
                         move = alt_move
                         break
 

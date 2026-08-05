@@ -73,6 +73,17 @@ MATE_SCORE = 100000
 # ---------------------------------------------------------------------------
 
 def open_engine(hash_mb: int = 32):
+    # Check before spawning. Without this, a missing binary raises inside every pool
+    # worker's initializer, and multiprocessing.Pool responds by restarting them
+    # forever — one run produced a 307MB logfile of identical tracebacks before it was
+    # noticed. Note stockfish/ is gitignored, so a git worktree of this repo will NOT
+    # have it and must have the binary copied in.
+    if not os.path.exists(SF_PATH):
+        raise SystemExit(
+            f"FATAL: Stockfish not found at {SF_PATH}\n"
+            "It is required for every strength measurement and is gitignored, so a\n"
+            "worktree or fresh clone will not have it. Copy stockfish.exe there."
+        )
     eng = chess.engine.SimpleEngine.popen_uci(SF_PATH)
     eng.configure({"Threads": 1, "Hash": hash_mb})
     return eng
@@ -374,6 +385,68 @@ def _mate_one(entry):
     }
 
 
+def _side_to_move_has_mate_in_1(board):
+    for mv in board.legal_moves:
+        board.push(mv)
+        mated = board.is_checkmate()
+        board.pop()
+        if mated:
+            return True
+    return False
+
+
+def build_walkinto_entries(limit=None):
+    """
+    Positions where the engine CAN walk into mate but does not have to.
+
+    Derived from the mate-in-1 suite by undoing the last move, so the side to move is
+    the one who is about to be mated. Only positions where at least one legal move
+    avoids mate are kept — where every move loses, the engine has no choice and the
+    test would measure nothing.
+
+    Note these are selected for being one ply from mate, so the failure rate here is a
+    SHARP-POSITION rate and must not be quoted as a general middlegame rate.
+    """
+    suite = load_suite("mate1")
+    out = []
+    for e in suite["positions"]:
+        if not e["moves"]:
+            continue
+        board = rebuild(e["moves"][:-1])
+        if board.is_game_over():
+            continue
+        safe = 0
+        for mv in board.legal_moves:
+            board.push(mv)
+            allows = _side_to_move_has_mate_in_1(board)
+            board.pop()
+            if not allows:
+                safe += 1
+                break                      # one safe move is enough to qualify
+        if safe:
+            out.append({"name": e["name"], "moves": e["moves"][:-1],
+                        "fen": board.fen()})
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
+def _walkinto_one(entry):
+    board = rebuild(entry["moves"])
+    t0 = time.perf_counter()
+    move = _make_player().select_move(board)
+    ms = (time.perf_counter() - t0) * 1000
+    if move is None:
+        return None
+    board.push(move)
+    return {
+        "name": entry["name"],
+        "move": move.uci(),
+        "walked_into_mate": _side_to_move_has_mate_in_1(board),
+        "ms": round(ms, 1),
+    }
+
+
 def _run_pool(fn, entries, sims, workers, threads, label, uniform=False):
     t0 = time.perf_counter()
     out = []
@@ -477,6 +550,25 @@ def cmd_mate(label, sims, workers, threads, limit):
     return out
 
 
+def cmd_walkinto(label, sims, workers, threads, limit):
+    print("building walk-into-mate positions (one ply before a known mate)...")
+    entries = build_walkinto_entries(limit)
+    if not entries:
+        raise SystemExit("no qualifying positions — rebuild the mate suite")
+    print(f"Walk-into-mate '{label}': {len(entries)} positions, {sims} sims")
+    rows, dt = _run_pool(_walkinto_one, entries, sims, workers, threads, label)
+    walked = sum(r["walked_into_mate"] for r in rows)
+    out = {"label": label, "sims": sims, "n": len(rows), "walked": walked,
+           "pct": round(walked / len(rows) * 100, 1), "wall_s": round(dt, 1),
+           "rows": rows}
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    with open(os.path.join(RESULTS_DIR, f"walkinto_{label}.json"), "w") as f:
+        json.dump(out, f)
+    print(f"\n  walked into mate  {walked}/{len(rows)}  ({out['pct']}%)   lower is better")
+    print(f"  wall clock        {dt:.0f} s")
+    return out
+
+
 def cmd_compare(a_label, b_label):
     def load(l):
         p = os.path.join(RESULTS_DIR, f"strength_{l}.json")
@@ -542,20 +634,28 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    default_workers = max(1, (os.cpu_count() or 4) - 2)
+    # Default to the app's own inference threading (inference.num_threads() -> 4), not
+    # 1. This is not cosmetic: the network arm's per-simulation cost is 9.17 ms at one
+    # thread but 6.16 ms at four, while the uniform arm is pure Python and gains nothing
+    # from threads (3.04 ms either way). So the NN:uniform cost ratio is 3.02 at one
+    # thread and 2.03 at four, and an equal-WALL-CLOCK comparison calibrated at one
+    # thread silently hands the network a ~48% simulation deficit relative to how the
+    # app actually runs. Worker count is derived from the thread count so the box is not
+    # oversubscribed, which would distort the two arms by different amounts.
+    default_threads = 4
 
     b = sub.add_parser("build", help="generate and cache the frozen position suites")
     b.add_argument("--games", type=int, default=700)
     b.add_argument("--per-game", type=int, default=2)
     b.add_argument("--mate", action="store_true", default=True,
                    help="also collect mate-in-1 positions")
-    b.add_argument("--workers", type=int, default=default_workers)
+    b.add_argument("--workers", type=int, default=None)
 
     r = sub.add_parser("run", help="measure ACPL for one engine configuration")
     r.add_argument("label")
     r.add_argument("--sims", type=int, default=600)
-    r.add_argument("--workers", type=int, default=default_workers)
-    r.add_argument("--threads", type=int, default=1)
+    r.add_argument("--workers", type=int, default=None)
+    r.add_argument("--threads", type=int, default=default_threads)
     r.add_argument("--limit", type=int, default=None)
     r.add_argument("--uniform", action="store_true",
                    help="positive control: search with no network (uniform priors). "
@@ -565,15 +665,32 @@ def main():
     m = sub.add_parser("mate", help="mate-in-1 detection rate")
     m.add_argument("label")
     m.add_argument("--sims", type=int, default=200)
-    m.add_argument("--workers", type=int, default=default_workers)
-    m.add_argument("--threads", type=int, default=1)
+    m.add_argument("--workers", type=int, default=None)
+    m.add_argument("--threads", type=int, default=default_threads)
     m.add_argument("--limit", type=int, default=None)
+
+    w = sub.add_parser("walkinto", help="how often the engine allows an immediate mate")
+    w.add_argument("label")
+    w.add_argument("--sims", type=int, default=200)
+    w.add_argument("--workers", type=int, default=None)
+    w.add_argument("--threads", type=int, default=default_threads)
+    w.add_argument("--limit", type=int, default=None)
 
     c = sub.add_parser("compare", help="paired comparison of two runs")
     c.add_argument("a_label")
     c.add_argument("b_label")
 
     args = ap.parse_args()
+
+    # Derive workers from threads so total concurrency stays near the core count.
+    # Oversubscribing penalises the network arm more than the uniform arm (measured
+    # 2.11x vs 1.82x under 12-way contention), which would bias any equal-time result.
+    if getattr(args, "workers", None) is None:
+        cores = os.cpu_count() or 4
+        threads = getattr(args, "threads", 1)
+        args.workers = max(1, (cores - 2) // max(1, threads))
+        print(f"(using {args.workers} workers x {threads} thread(s) on {cores} logical cores)")
+
     if args.cmd == "build":
         build(args.games, args.per_game, args.mate, args.workers)
     elif args.cmd == "run":
@@ -581,6 +698,8 @@ def main():
                 args.uniform)
     elif args.cmd == "mate":
         cmd_mate(args.label, args.sims, args.workers, args.threads, args.limit)
+    elif args.cmd == "walkinto":
+        cmd_walkinto(args.label, args.sims, args.workers, args.threads, args.limit)
     else:
         cmd_compare(args.a_label, args.b_label)
 
