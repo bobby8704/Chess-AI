@@ -63,6 +63,7 @@ MIN_PIECES = 12         # stay clear of the <=7-piece tablebase HTTP probe
 MIN_LEGAL = 8
 MAX_LEGAL = 48
 BLUNDER_CP = 200        # a "blunder" for reporting purposes
+EQUIVALENCE_CP = 20     # a null this tight is a real bound, not a failed experiment
 LOSS_CAP = 1000         # cap so a single mate score cannot dominate the mean
 MATE_SCORE = 100000
 
@@ -510,15 +511,29 @@ def cmd_compare(a_label, b_label):
     print(f"  moves differing     {changed}/{len(shared)} ({changed/len(shared)*100:.1f}%)")
 
     print()
+    # 80% power at alpha=0.05 corresponds to roughly 2.8 standard errors.
+    detectable = 2.8 * sd / math.sqrt(len(shared))
     if p < 0.05:
         better = b_label if mean < 0 else a_label
         print(f"  SIGNIFICANT at alpha=0.05 — {better} is stronger on this suite.")
+    elif detectable <= EQUIVALENCE_CP:
+        # A null result is only uninformative when the test was too weak to see the
+        # effect. Here it was not: report the bound instead of crying underpower,
+        # because calling a well-powered null "inconclusive" is its own kind of wrong.
+        print(f"  NOT SIGNIFICANT, and this run had the power to say so: it would have")
+        print(f"  detected any difference larger than ~{detectable:.0f} cp. The true")
+        print(f"  difference lies within [{lo:+.1f}, {hi:+.1f}] cp with 95% confidence.")
+        if changed == 0:
+            print(f"  Every chosen move is identical — the arms are behaviourally the same.")
+        elif changed < len(shared) * 0.02:
+            print(f"  Only {changed}/{len(shared)} moves differ, so the change barely")
+            print(f"  applies to this suite. It may still matter a lot where it DOES")
+            print(f"  apply — check a targeted benchmark before concluding it is useless.")
     else:
         need = n_for_delta(sd, 20)
-        print(f"  NOT SIGNIFICANT. This does NOT mean the arms are equal — it means this")
+        print(f"  UNDERPOWERED. This does NOT mean the arms are equal — it means this")
         print(f"  experiment could not tell. Resolving a 20cp difference at this variance")
         print(f"  needs {need} paired positions; you ran {len(shared)}.")
-        detectable = 2.8 * sd / math.sqrt(len(shared))
         print(f"  Smallest difference {len(shared)} positions could detect: ~{detectable:.0f} cp.")
 
 

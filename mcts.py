@@ -192,9 +192,17 @@ def is_blunder_move(board: chess.Board, move: chess.Move) -> Tuple[bool, float]:
 
     board_copy.push(move)
 
-    # Check for immediate checkmate (we got mated)
+    # After OUR move it is the OPPONENT to move, so is_checkmate() here means we just
+    # delivered mate — the best move on the board, not a blunder. This used to return
+    # (True, 100.0), which sent the mating move through the blunder branch and crushed
+    # its root prior from 0.95 to ~0.0002. Measured cost of that inversion: the engine
+    # found mate in 1 in only 8.8% of positions where one existed (64/731 at 200 sims).
+    #
+    # Note the original comment's intent — "we got mated" — is NOT implemented here or
+    # anywhere else: detecting that we walk INTO a mate needs a search of the
+    # opponent's replies, which this function never does.
     if board_copy.is_checkmate():
-        return True, 100.0
+        return False, 0.0
 
     # Check if opponent can make a profitable capture after our move
     # Exclude the square we just moved to (that exchange is already evaluated above)
