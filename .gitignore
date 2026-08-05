@@ -29,8 +29,12 @@ data/training/*.pt
 data/training/*.npz
 data/datasets/
 
-# Benchmark results (machine-specific timings, regenerate with bench/verify.py)
+# Benchmark results are regenerable and contain machine-specific timings.
 bench/results/
+
+# bench/suites/ is deliberately TRACKED. The strength comparison is only valid if both
+# arms run on the identical frozen position set, so the suite must be shared and stable
+# across commits and machines — rebuilding it silently invalidates every prior number.
 
 # NOTE: models/dual_model_mcts_fp32.onnx is deliberately TRACKED, not ignored. It is
 # the artifact the web server actually serves, and keeping it in the repo is what makes
