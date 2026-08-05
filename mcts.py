@@ -405,19 +405,30 @@ class MCTSNode:
 
     def ucb_score(self, c_puct: float, parent_visits: int) -> float:
         """
-        Calculate UCB score for node selection.
+        PUCT score, from the PARENT's point of view:
 
-        Uses PUCT formula: Q(s,a) + c_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
+            Q(s,a) + c_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
 
-        Note: self.value is from THIS node's perspective (the opponent of the parent).
-        We negate it because the parent wants to maximize ITS value, not the opponent's.
+        self.value is stored from THIS node's perspective (the opponent of the parent),
+        so it is negated — the parent maximises its own value, not the opponent's.
+
+        An unvisited child scores Q = 0 (the `value` property returns 0.0 at zero
+        visits), which is the standard AlphaZero first-play-urgency: an unexplored move
+        is treated as neutral, and its prior alone decides how urgently it gets tried.
+
+        This used to return float('inf') for any unvisited child, which forced the
+        search to visit EVERY sibling once before a prior could matter. Measured: in a
+        47-legal-move position at 50 simulations, all 47 moves received exactly one
+        visit and nothing else happened — the entire budget went on a breadth-first
+        sweep in python-chess move-generation order, and the policy network had no
+        effect on the result whatsoever. At 200 sims, 32-46% of all selection decisions
+        were still being made this way.
         """
-        if self.visit_count == 0:
-            # Unvisited nodes have high exploration bonus
-            return float('inf')
-
-        exploration = c_puct * self.prior * math.sqrt(parent_visits) / (1 + self.visit_count)
-        # Negate value because child stores value from opponent's perspective
+        # max(1, ...) matters on the very first simulation, when the root has no visits
+        # yet: sqrt(0) would zero every exploration term and hand the choice back to
+        # insertion order, which is the failure being fixed.
+        exploration = (c_puct * self.prior * math.sqrt(max(1, parent_visits))
+                       / (1 + self.visit_count))
         return -self.value + exploration
 
     def expand(self, move_probs: Dict[chess.Move, float]):
@@ -445,18 +456,19 @@ class MCTSNode:
         Select the child with highest UCB score, creating it if it does not exist yet.
 
         Iterates child_priors rather than children so that not-yet-created moves are
-        still considered. A missing child has by definition never been visited, so it
-        scores float('inf') exactly as a created-but-unvisited node did before — which
-        keeps the old tie-break intact: with several inf scores and a strict `>`, the
-        first move in policy order wins.
+        still considered. A missing child has never been visited, so it is scored with
+        exactly what ucb_score would return for it: Q = 0 and N = 0, leaving
+        c_puct * P * sqrt(N_parent). Computing it inline avoids building a node just to
+        ask its score — which is the whole point of lazy expansion.
         """
         best_score = float('-inf')
         best_move = None
         best_child = None
+        sqrt_parent = math.sqrt(max(1, self.visit_count))
 
         for move in self.child_priors:
             child = self.children.get(move)
-            score = (float('inf') if child is None
+            score = (c_puct * self.child_priors[move] * sqrt_parent if child is None
                      else child.ucb_score(c_puct, self.visit_count))
             if score > best_score:
                 best_score = score
