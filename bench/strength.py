@@ -63,7 +63,13 @@ MIN_PIECES = 12         # stay clear of the <=7-piece tablebase HTTP probe
 MIN_LEGAL = 8
 MAX_LEGAL = 48
 BLUNDER_CP = 200        # a "blunder" for reporting purposes
-EQUIVALENCE_CP = 20     # a null this tight is a real bound, not a failed experiment
+# A null tighter than this is reported as a bound rather than a failed experiment.
+# It was 20, which was far too loose to mean anything: head-to-head games later showed
+# ~10 cp of ACPL is worth roughly 200 Elo, so a "20 cp equivalence bound" was nearly
+# 400 Elo wide, and using it cost a real 220 Elo when it licensed cutting the hard
+# preset. Even 3 cp is ~60 Elo, which is why the message below refuses to call any ACPL
+# null a strength equivalence at all.
+EQUIVALENCE_CP = 3
 LOSS_CAP = 1000         # cap so a single mate score cannot dominate the mean
 MATE_SCORE = 100000
 
@@ -629,12 +635,13 @@ def cmd_compare(a_label, b_label):
         better = b_label if mean < 0 else a_label
         print(f"  SIGNIFICANT at alpha=0.05 — {better} is stronger on this suite.")
     elif detectable <= EQUIVALENCE_CP:
-        # A null result is only uninformative when the test was too weak to see the
-        # effect. Here it was not: report the bound instead of crying underpower,
-        # because calling a well-powered null "inconclusive" is its own kind of wrong.
-        print(f"  NOT SIGNIFICANT, and this run had the power to say so: it would have")
-        print(f"  detected any difference larger than ~{detectable:.0f} cp. The true")
-        print(f"  difference lies within [{lo:+.1f}, {hi:+.1f}] cp with 95% confidence.")
+        # Tight by ACPL's standards — but still say what it does NOT license.
+        print(f"  NOT SIGNIFICANT, and this run had the power to say so in ACPL terms:")
+        print(f"  it would have detected any difference larger than ~{detectable:.1f} cp,")
+        print(f"  and the true difference lies within [{lo:+.1f}, {hi:+.1f}] cp.")
+        print(f"  This is still NOT a strength-equivalence result: ~10 cp of ACPL has")
+        print(f"  measured at roughly 200 Elo head-to-head, so even this interval spans")
+        print(f"  tens of Elo. Confirm with bench/elo.py before removing anything.")
         if changed == 0:
             print(f"  Every chosen move is identical — the arms are behaviourally the same.")
         elif changed < len(shared) * 0.02:

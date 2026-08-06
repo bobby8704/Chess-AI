@@ -42,33 +42,30 @@ MODEL_PATH = "models/dual_model_mcts.pt"
 
 # Difficulty presets: name -> simulations.
 #
-# Recalibrated from measurement (bench/strength.py). Single-request latency on an idle
-# box through this exact serving path (ONNX fp32, CHESS_NUM_THREADS=4, fresh player per
-# move), median / p90 / CPU-seconds:
+# Set from HEAD-TO-HEAD GAMES (bench/elo.py), not from ACPL. Simulation count turns out
+# to dominate playing strength, and each rung below is a measured Elo gap:
 #
-#     100 sims   518 /  662 ms   1.1 s CPU      <- easy
-#     300 sims  1544 / 1847 ms   3.0 s CPU      <- medium
-#     600 sims  3203 / 4196 ms   6.3 s CPU      <- hard
-#    1300 sims  7033 / 8681 ms  14.3 s CPU      <- the OLD hard tier
+#     sims   latency (median/p90)   measured strength
+#      100    518 /  662 ms         baseline
+#      600   3203 / 4196 ms         +328 Elo over 100   (CI [+242,+468], 80 games)
+#     1300   7033 / 8681 ms         +220 Elo over 600   (CI [+128,+352], 50 games)
 #
-# Dropping hard from 1300 to 600 is free strength-wise: 1300 sims measured +0.17 cp
-# against 600 (95% CI [-8.31, +8.66], 98/400 moves differ, so a live comparison rather
-# than a tie) while costing 2.2x the latency and 2.3x the CPU. 600 is the knee of the
-# ACPL-vs-simulations curve. On a single core the old tier cost 17.8 s per move.
+# Latency is single-request on an idle box through this exact serving path (ONNX fp32,
+# CHESS_NUM_THREADS=4, fresh player per move).
 #
-# Dropping medium to 300 is NOT free: it costs a measured ~10 cp (p=0.034 on ply 18-25,
-# corroborated by a +6.24 cp full-suite 200-vs-600 contrast, p=0.0146). That is
-# deliberate — it is the only rung on this ladder that measurably changes strength.
+# THESE WERE BRIEFLY SET TO 100/300/600 AND THAT WAS A ~220 ELO REGRESSION. The cut was
+# justified by an ACPL measurement of +0.17 cp for 1300 over 600, with a 95% CI of
+# [-8.31, +8.66] cp, read as "no difference". It was not: ~10 cp of ACPL is worth
+# roughly 200 Elo, so that interval spanned about +/-150 Elo and contained nothing but
+# ignorance. ACPL scores one move from a static position; in a real game the small
+# per-move edges compound. Do not size a strength decision with it — use bench/elo.py.
 #
-# Honest caveat: 100/200/300 sims are mutually indistinguishable on strength, so easy
-# and medium differ mainly in latency. Making easy genuinely weaker needs a mechanism
-# that measurably degrades play (root temperature > 0 or top-k sampling), not fewer
-# simulations. Safety is unaffected across the range: mate-in-1 300/300 at 50, 100, 300
-# and 600 sims; walk-into-mate 0/200 at both 50 and 600.
+# Safety is unaffected across the range: mate-in-1 300/300 at 50, 100, 300 and 600 sims;
+# walk-into-mate 0/200 at both 50 and 600.
 DIFFICULTY_PRESETS = {
     "easy": 100,
-    "medium": 300,
-    "hard": 600,
+    "medium": 600,
+    "hard": 1300,
 }
 
 print("Loading chess AI model...")

@@ -5,8 +5,26 @@ Measurement tooling for the chess engine. Three questions, three tools.
 | Question | Tool |
 |---|---|
 | Did this change the moves the engine plays? | `verify.py` |
-| Did this make the engine stronger or weaker? | `strength.py` |
+| Is this move-quality change worth pursuing? | `strength.py` (ACPL — a cheap screen) |
+| **Is the engine actually stronger?** | **`elo.py` (real games — the deciding answer)** |
 | Can the app still be deployed? | `test_deploy.py` |
+
+## Read this before trusting a centipawn number
+
+**ACPL massively understates game strength, and the relationship is not linear.** The
+same change measured **−10.33 cp** of ACPL and **+209 Elo** head-to-head — it wins three
+games in four. In a game, small per-move edges compound: a deeper search wins material
+repeatedly and each edge feeds the next.
+
+Two consequences, both learned the hard way:
+
+- **Never justify removing something with an ACPL null.** A 95% CI of ±8 cp sounds tight
+  and is worth roughly ±150 Elo. Acting on exactly that interval cut the `hard` preset
+  from 1300 to 600 sims and cost a measured **220 Elo**.
+- **Treat every "N cp" figure as a lower bound on game impact**, never as a measure of it.
+
+ACPL is still worth having: it is ~100× cheaper than playing games, deterministic, and
+fine for screening whether a change is worth a real match. It just cannot settle one.
 
 ## verify.py — move equivalence and latency
 
@@ -61,6 +79,38 @@ experiment could not tell", never "there is no difference."**
 Run `run --uniform` for a positive control: search with no network at all. It must
 come out clearly worse. If a comparison against *that* is not significant, the harness
 has no power on that sample and no null result from it should be believed.
+
+## elo.py — head-to-head games
+
+The only instrument here that measures strength as a player experiences it.
+
+```bash
+python bench/elo.py h2h --a current:600 --b inf-rule:600 --pairs 80
+python bench/elo.py gauntlet --a current:600 --elos 1320 --pairs 25
+python bench/elo.py variants
+```
+
+Design choices that make a few hundred games informative: **paired openings with colour
+reversal** (statistics over pairs, so opening difficulty and colour advantage cancel),
+**near-balanced starting positions** reusing the Stockfish evaluations already cached in
+the suite, **independent Stockfish adjudication** rather than the engine's own eval,
+which would be circular, and the **Lichess tablebase probe disabled** so no measurement
+depends on a third-party service.
+
+Every run prints two self-checks. If the colour-reversed games of a pair are
+move-for-move identical, the arms are the same engine and the run measures only colour —
+that failure once produced a perfectly plausible "Elo 0.0". A large White/Black
+imbalance is reported separately, because that is an engine property, not an arm
+difference.
+
+**Gauntlet caveat:** `UCI_Elo` assumes standard time controls. Stockfish gets 100 ms per
+move here, so it plays below its nominal rating and the absolute figure *flatters* the
+engine. Read it as a soft upper bound. The `h2h` differences do not have this problem.
+
+**Comparing two weak engines through a much stronger common opponent discriminates
+poorly** — both lose, scores compress against the floor. The gauntlet showed 100 and 600
+sims scoring identically against Stockfish 1320; direct `h2h` put them 328 Elo apart.
+Use `h2h` for A/B, and the gauntlet only for an absolute anchor.
 
 ## test_deploy.py — deployability
 
