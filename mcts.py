@@ -335,6 +335,96 @@ def is_blunder_move(board: chess.Board, move: chess.Move) -> Tuple[bool, float]:
 TREE_STACK_DEPTH = 8
 
 
+def leaf_value(board: chess.Board, nn_value: float, weight: float) -> float:
+    """
+    Value of a non-terminal leaf: a blend of the network's value head and quiescence.
+
+        weight = 0.0  quiescence only    (what ships, and what should keep shipping)
+        weight = 1.0  value head only    (skips quiescence; measured 1.23x, and -307 Elo)
+        0 < w < 1     w*value_head + (1-w)*quiescence
+
+    THE DEFAULT IS 0.0 AND SHOULD STAY THERE. Using the value head at a leaf was measured
+    head-to-head with bench/elo.py, on dual_model_v2 for BOTH arms so that the leaf value
+    was the only difference, at 100 simulations:
+
+        weight   arm         Elo vs quiescence      95% CI            games
+        0.5      vh-blend         -137.0        [-186.5, -92.3]        240
+        1.0      vh-only          -307.1        [-410.3, -234.9]       120
+
+    Monotone in the weight, both far outside noise (each run resolves ~+/-60 Elo). The
+    value head is not a viable leaf evaluator here at ANY weight, and this is not a
+    training problem — v2's head is well trained (82% teacher agreement, r 0.570 against
+    depth-16 Stockfish). A leaf is usually mid-capture-sequence, and a static evaluator
+    cannot see the recapture. That is the whole job evaluate_quiescence exists to do.
+
+    THE OFFLINE SCREEN SAID THE OPPOSITE, CONFIDENTLY. On the 1474-position committed
+    suite, scored against the depth-16 Stockfish evals cached there as base_cp:
+
+        evaluator                    MSE     pearson r   spearman
+        quiescence                 0.1862     0.638       0.576
+        value head (v2)            0.1736     0.570       0.514
+        0.5*head + 0.5*quiescence  0.1305     0.702       0.630
+
+    The blend wins on every column, and the reasoning behind it was not obviously wrong:
+    the two evaluators' residuals correlate only +0.45, quiescence is largely a material
+    counter (r 0.769 with plain material) and the head is not (r 0.543), so the blend
+    genuinely does carry more information ABOUT THOSE POSITIONS. The flaw is the position
+    set. Suite positions are quiet — sampled at ply boundaries of Stockfish games — while
+    the positions this function is actually called on are the tactically unstable ones the
+    search just descended into. The screen measured the right quantity on the wrong
+    distribution, which is the same mistake export_onnx.py made when it verified on
+    gaussian noise instead of real piece planes.
+
+    So: r against a quiet-position reference does NOT predict leaf-evaluator quality. Do
+    not resurrect this on the strength of an offline metric; it costs about four hours of
+    games to find out, and the offline number was 0.702 vs 0.638 in the wrong direction.
+
+    ONLY ABOUT HALF THE LOSS IS THE VALUE HEAD. A control arm (bench/elo.py
+    `quiesc-scaled`) played plain quiescence scaled by 0.70 — the exact factor by which
+    blending shrinks the leaf value's spread, sd 0.354 against quiescence's 0.504 — which
+    is rank-preserving and therefore carries IDENTICAL information. It lost 73.5 Elo,
+    95% CI [-140.3, -11.7]. So merely compressing the leaf value costs most of a hundred
+    Elo on its own, and the blend was paying that penalty on top of its worse evaluation.
+
+    That matters well beyond the value head, because scaling every leaf value by k is
+    equivalent to scaling c_puct by 1/k: PUCT selects on -Q + c_puct*P*sqrt(N)/(1+N), and
+    dividing by k leaves c_puct/k (exactly, apart from terminal values, which do not
+    scale). The control is therefore approximately c_puct 1.5 -> 2.14, and it cost 73.5
+    Elo — so c_puct is a high-leverage parameter here and MORE exploration is worse. Note
+    that points the opposite way to the earlier ACPL sweep, which drifted toward more
+    exploration and called 8.0 best at p=0.23; that sweep was an underpowered proxy. Any
+    future evaluator swapped in here must match quiescence's spread, or it will be
+    penalised for its scale on top of its merits.
+
+    Both terms are on the SAME scale and perspective, which is the only reason they can be
+    added at all: evaluate_quiescence returns tanh(cp/400) from the side to move, and
+    training/train_stockfish.py trains the value head on tanh(eval/4.0) in pawns from the
+    side to move — the same transform. Any future attempt must re-check that first.
+
+    Also worth knowing before trying again: the shipped v1 head is far worse than v2's
+    (r 0.244, sd 0.140 — it barely leaves zero, having been trained against the old
+    stochastic Skill-Level-12 teacher), so any value-head experiment run against the
+    SERVED model measures a false negative for the wrong reason.
+    """
+    if weight <= 0.0:
+        from evaluation import evaluate_quiescence
+        return evaluate_quiescence(board)
+
+    if weight >= 1.0:
+        # These two checks are NOT redundant with MCTSNode.is_terminal, which uses
+        # board.is_game_over() — that does not claim draws. evaluate_quiescence tests
+        # both and returns 0, so dropping it here would quietly hand the value head
+        # positions it has no way to judge: nothing in a 13-plane board tensor encodes
+        # repetition or the halfmove clock, so a drawn shuffle would keep scoring as
+        # whatever the material happens to be.
+        if board.is_insufficient_material() or board.can_claim_draw():
+            return 0.0
+        return nn_value
+
+    from evaluation import evaluate_quiescence
+    return weight * nn_value + (1.0 - weight) * evaluate_quiescence(board)
+
+
 @dataclass
 class MCTSConfig:
     """Configuration for MCTS search."""
@@ -348,6 +438,9 @@ class MCTSConfig:
     use_material_eval: bool = True    # Use hybrid material evaluation
     material_weight: float = 0.35     # Weight for material eval - NN value head is weak, material fills the gap
     blunder_penalty: float = 0.8      # Penalty for blunder moves (reduces prior)
+    # Share of the leaf value taken from the network's value head; see leaf_value().
+    # 0.0 = quiescence only, which is what shipped before this knob existed.
+    value_head_weight: float = 0.0
 
 
 class MCTSNode:
@@ -1230,12 +1323,15 @@ class MCTSPlayer:
         self,
         board: chess.Board
     ) -> Tuple[Dict[chess.Move, float], float]:
-        """Fast evaluation for non-root nodes: NN policy + quiescence search value.
-        Quiescence extends captures to avoid evaluating unstable positions."""
-        move_probs, _ = self._nn_forward(board)
+        """Fast evaluation for non-root nodes: NN policy + leaf value.
 
-        from evaluation import evaluate_quiescence
-        value = evaluate_quiescence(board)
+        The value used to be evaluate_quiescence unconditionally, with the value head
+        computed by the forward pass above and thrown away. config.value_head_weight now
+        decides the mix — see leaf_value(). It defaults to 0.0, i.e. quiescence only, so
+        this is inert until something sets it."""
+        move_probs, nn_value = self._nn_forward(board)
+
+        value = leaf_value(board, nn_value, self.config.value_head_weight)
 
         # Normalize
         total = sum(move_probs.values())
@@ -1249,14 +1345,15 @@ class MCTSPlayer:
         board: chess.Board
     ) -> Tuple[Dict[chess.Move, float], float]:
         """Full evaluation for root node: NN + heuristics + blunder detection."""
-        move_probs, _ = self._nn_forward(board)
+        move_probs, nn_value = self._nn_forward(board)
 
         # Heuristic policy adjustments (only at root — too expensive per-sim)
         move_probs = _apply_heuristic_boosts(board, move_probs)
 
-        # Position value with quiescence search (plays out captures)
-        from evaluation import evaluate_quiescence
-        value = evaluate_quiescence(board)
+        # Kept in step with _evaluate_fast so the two cannot drift, though MCTS.search
+        # discards the root value (`move_probs, _ = root_eval_fn(board)`) — the root is
+        # never backpropagated through, only expanded. Costs one call per move.
+        value = leaf_value(board, nn_value, self.config.value_head_weight)
 
         # Blunder detection (only at root)
         blunder_moves = {}

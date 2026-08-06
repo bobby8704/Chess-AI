@@ -103,6 +103,38 @@ that failure once produced a perfectly plausible "Elo 0.0". A large White/Black
 imbalance is reported separately, because that is an engine property, not an arm
 difference.
 
+### Two kinds of variant
+
+`VARIANTS` patches **class attributes** on `mcts`, which are process-global, so an arm's
+patches are applied immediately before each of its moves. `VARIANT_CONFIG` instead sets
+fields on that arm's **`MCTSConfig` instance**. Prefer the config route for anything
+reachable from `MCTSConfig`: each arm owns its own player, so two arms cannot collide the
+way class patches can, and nothing has to be re-applied per move. The monkeypatch is for
+changes that no config field can express.
+
+The `vh-*` arms (value head in the leaf evaluation) are config variants. They are only
+meaningful against a model whose value head was trained on clean labels — pass
+`--a-model`/`--b-model models/dual_model_v2_fp32.onnx`. The shipped v1 head correlates
+0.244 with Stockfish and would measure a false negative. See `mcts.leaf_value`.
+
+### One dead adjudicator used to destroy the whole run
+
+Adjudicator Stockfish processes sometimes die under concurrency. That aborted the entire
+pool: the `EngineTerminatedError` propagates out of `imap_unordered`, every other worker is
+torn down mid-game, and the run ends with no results file and a handful of orphaned
+`stockfish.exe` processes. Three runs of 120-240 games were lost that way, each inside the
+first minute, and the symptom is easy to misread — the parent sits at 0% CPU with orphans
+alive, which looks far more like memory exhaustion than like a crashed child.
+
+The adjudicator is now restarted and the analysis retried. The restart count prints with
+the results and is stored per game as `adj_restarts`. Restarts do not bias a comparison —
+the adjudicator is common to both arms and independent of the position — but a run with
+more than a handful of them is a run whose environment is unhealthy.
+
+Worker count is also worth a thought: the default `(cores - 2) // threads` counts cores,
+but every worker owns a ~265MB Stockfish on top of its ONNX sessions, so on a 16GB machine
+that is already several GB before any search happens.
+
 **Gauntlet caveat:** `UCI_Elo` assumes standard time controls. Stockfish gets 100 ms per
 move here, so it plays below its nominal rating and the absolute figure *flatters* the
 engine. Read it as a soft upper bound. The `h2h` differences do not have this problem.

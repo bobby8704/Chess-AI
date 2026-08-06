@@ -77,6 +77,23 @@ MAX_PLIES = 250
 # identical ply count, because it was measuring inf-rule against itself. So a variant is
 # expressed as a set of overrides and ACTIVATED immediately before each move, for
 # whichever arm is to play. Switching is just attribute assignment, so it is free.
+#
+# EQUALLY CRITICAL, and learned the same way — by a run that measured nothing:
+# PATCHING MCTSPlayer._evaluate_fast OR ._evaluate_full DOES NOT WORK. MCTSPlayer.__init__
+# passes `evaluate_fn=self._evaluate_fast` to MCTS, which binds the method THERE AND THEN;
+# the search calls that captured bound method and never looks at the class again. A class
+# patch applied afterwards is silently ignored. (MCTSNode.ucb_score and select_child are
+# fine — those are looked up on the class at call time, which is why inf-rule works.)
+#
+# Reach the leaf evaluation one of these two ways instead:
+#   * VARIANT_CONFIG, if MCTSConfig can express it. _evaluate_fast reads
+#     self.config.value_head_weight on every call, so config changes DO take effect.
+#   * a module-level patch, e.g. ("evaluation", "evaluate_quiescence"). mcts.leaf_value
+#     imports that name inside the function body, so it is resolved per call.
+#
+# A variant that silently does nothing is not a hypothetical: it produced a full 120-game
+# run with a perfectly reasonable-looking Elo of -0.0. The all-pairs-identical check at the
+# end of cmd_h2h is what caught it, and is the reason that check exists.
 
 def _overrides_current():
     """Ship-as-is."""
@@ -117,9 +134,81 @@ def _overrides_inf_rule():
             ("MCTSNode", "select_child"): select_child}
 
 
+def _overrides_vh_blend():
+    """Leaf value = 0.5*value head + 0.5*quiescence (config, see VARIANT_CONFIG)."""
+    return {}
+
+
+def _overrides_vh_blend30():
+    """Leaf value = 0.3*value head + 0.7*quiescence."""
+    return {}
+
+
+def _overrides_vh_blend70():
+    """Leaf value = 0.7*value head + 0.3*quiescence."""
+    return {}
+
+
+def _overrides_vh_only():
+    """Leaf value = the value head alone; skips quiescence, so it is also the fast arm."""
+    return {}
+
+
+# A positive control for the value-head experiment, in the spirit of strength.py's
+# --uniform arm. vh-blend lost 137 Elo, and there are two candidate explanations that the
+# head-to-head cannot separate on its own:
+#
+#   (a) the value head's information is bad at MCTS leaves (it cannot see captures), or
+#   (b) nothing to do with information — blending SHRINKS the leaf value's spread, and
+#       PUCT compares Q against an exploration term that does not shrink with it, so the
+#       search simply explores more.
+#
+# This arm isolates (b): it scales quiescence by the exact factor the blend shrinks by,
+# leaving the information content identical (a positive multiple is rank-preserving, so it
+# correlates 1.000 with plain quiescence). If it also loses heavily, the damage is search
+# dynamics rather than the value head, and a rescaled blend is worth testing. If it is
+# neutral, (b) is dead and the value head's content is the problem.
+def _overrides_quiesc_scaled():
+    """Control: quiescence x0.70; the blend's value SPREAD, none of its information."""
+    # Captured before any patching, so this is always the pristine function and the
+    # wrapper cannot recurse into itself.
+    from evaluation import evaluate_quiescence as _pristine_quiescence
+
+    def scaled(board, max_depth=2):
+        # 0.70 = sd(0.5*value_head + 0.5*quiescence) / sd(quiescence), measured over the
+        # 1474-position suite: 0.354 / 0.504.
+        return 0.70 * _pristine_quiescence(board, max_depth)
+
+    return {("evaluation", "evaluate_quiescence"): scaled}
+
+
 VARIANTS = {
     "current": _overrides_current,
     "inf-rule": _overrides_inf_rule,
+    "quiesc-scaled": _overrides_quiesc_scaled,
+    "vh-blend": _overrides_vh_blend,
+    "vh-blend30": _overrides_vh_blend30,
+    "vh-blend70": _overrides_vh_blend70,
+    "vh-only": _overrides_vh_only,
+}
+
+# Per-arm MCTSConfig overrides, applied when the arm's player is constructed.
+#
+# This is the OTHER way to express a variant, and it is the safer one where it applies: a
+# config lives on the MCTSPlayer INSTANCE, and each arm has its own player, so two arms
+# cannot collide the way the class-level patches above can. No per-move activation is
+# needed. Prefer this for anything reachable from MCTSConfig; the monkeypatch is only for
+# changes that are not.
+#
+# The value-head arms are only meaningful against a model whose value head was trained on
+# clean labels — pass --a-model/--b-model models/dual_model_v2_fp32.onnx. The shipped v1
+# head scores r=0.244 against Stockfish and would measure a false negative. See
+# mcts.leaf_value.
+VARIANT_CONFIG = {
+    "vh-blend": {"value_head_weight": 0.5},
+    "vh-blend30": {"value_head_weight": 0.3},
+    "vh-blend70": {"value_head_weight": 0.7},
+    "vh-only": {"value_head_weight": 1.0},
 }
 
 _PRISTINE = {}
@@ -127,16 +216,33 @@ _OVERRIDES = {}
 _ACTIVE = None
 
 
-def _prepare_variants(names):
-    """Capture pristine class attributes, then build each variant's override table."""
+def _resolve_target(name):
+    """
+    A variant's patch target: a class in mcts, or a module by name.
+
+    Module targets exist because the useful interception point is not always a class
+    attribute. mcts.leaf_value does `from evaluation import evaluate_quiescence` INSIDE
+    the function, so that name is looked up fresh on every call and patching the module
+    attribute takes effect immediately — which a class patch cannot do here. See the
+    warning on VARIANTS about bound methods.
+    """
     import mcts as M
+    obj = getattr(M, name, None)
+    if obj is not None:
+        return obj
+    import importlib
+    return importlib.import_module(name)
+
+
+def _prepare_variants(names):
+    """Capture pristine attributes, then build each variant's override table."""
     global _ACTIVE
     for name in names:
         ov = VARIANTS[name]()
-        for (cls_name, attr) in ov:
-            key = (cls_name, attr)
+        for (target, attr) in ov:
+            key = (target, attr)
             if key not in _PRISTINE:
-                _PRISTINE[key] = getattr(getattr(M, cls_name), attr)
+                _PRISTINE[key] = getattr(_resolve_target(target), attr)
         _OVERRIDES[name] = ov
     _ACTIVE = None
 
@@ -157,11 +263,10 @@ def activate(name, arm_key=None):
         inference._ort_session = _ARM_SESSION[arm_key]
     if name == _ACTIVE:
         return
-    import mcts as M
-    for (cls_name, attr), val in _PRISTINE.items():        # reset everything first
-        setattr(getattr(M, cls_name), attr, val)
-    for (cls_name, attr), val in _OVERRIDES[name].items():  # then apply this variant
-        setattr(getattr(M, cls_name), attr, val)
+    for (target, attr), val in _PRISTINE.items():           # reset everything first
+        setattr(_resolve_target(target), attr, val)
+    for (target, attr), val in _OVERRIDES[name].items():    # then apply this variant
+        setattr(_resolve_target(target), attr, val)
     _ACTIVE = name
 
 
@@ -235,11 +340,18 @@ def _init_worker(arms, threads, sf_elo=None, sf_movetime=0.1, models=None):
         raise RuntimeError("no model available; refusing to measure a random policy")
 
     # Per-arm models, so two CHECKPOINTS can be compared, not just two code variants.
+    # Sessions are shared by PATH: comparing two code variants on the same model is a
+    # normal thing to want, and loading that model once per arm doubled the memory for
+    # nothing. Worth keeping lean because every worker also owns a ~265MB Stockfish
+    # adjudicator, so worker count costs far more memory than the core count suggests.
     if models:
         from inference import OnnxPolicyValue
+        by_path = {}
         for key, path in models.items():
             if path:
-                _ARM_SESSION[key] = OnnxPolicyValue(path, threads=threads)
+                if path not in by_path:
+                    by_path[path] = OnnxPolicyValue(path, threads=threads)
+                _ARM_SESSION[key] = by_path[path]
 
     from mcts import MCTSPlayer, MCTSConfig
     for key, (variant, sims) in arms.items():
@@ -247,8 +359,44 @@ def _init_worker(arms, threads, sf_elo=None, sf_movetime=0.1, models=None):
             continue
         _PLAYERS[key] = MCTSPlayer(
             model=model,
-            config=MCTSConfig(num_simulations=sims, temperature=0, add_noise=False))
+            config=MCTSConfig(num_simulations=sims, temperature=0, add_noise=False,
+                              **VARIANT_CONFIG.get(variant, {})))
     _ENGINE = open_engine()
+
+
+_ENGINE_RESTARTS = 0
+
+
+def _analyse_adj(board, depth=ADJ_DEPTH):
+    """
+    Analyse with the adjudicator, restarting it if its process has died.
+
+    Adjudicator Stockfish processes die occasionally under concurrency — the worker sees
+    `EngineTerminatedError: engine event loop dead`, which python-chess raises only once
+    the engine PROCESS has exited (SimpleEngine.popen awaits protocol.returncode and then
+    closes). One such death used to abort the whole pool: the exception propagates out of
+    imap_unordered, every other worker is torn down mid-game, and a multi-hour run ends
+    with no results file and 6-9 orphaned stockfish.exe processes. Measured here: three
+    separate 120-240 game runs lost that way, each inside the first minute.
+
+    A dead adjudicator is not a measurement error — it is independent of both arms and of
+    the position — so restarting and retrying is sound. What is NOT sound is hiding it, so
+    restarts are counted and reported with the results.
+    """
+    global _ENGINE, _ENGINE_RESTARTS
+    last = None
+    for _ in range(3):
+        try:
+            return analyse(_ENGINE, board, depth=depth)
+        except chess.engine.EngineError as exc:
+            last = exc
+            _ENGINE_RESTARTS += 1
+            try:
+                _ENGINE.close()
+            except Exception:
+                pass
+            _ENGINE = open_engine()
+    raise last
 
 
 def _adjudicate(board, history):
@@ -257,7 +405,7 @@ def _adjudicate(board, history):
 
     Uses Stockfish rather than the engine's own evaluation, which would be circular.
     """
-    info = analyse(_ENGINE, board, depth=ADJ_DEPTH)
+    info = _analyse_adj(board)
     cp = info["score"].white().score(mate_score=MATE_SCORE)
     history.append(cp)
 
@@ -283,12 +431,13 @@ def _play_game(task):
     moves_played = []
     result = None
     t0 = time.perf_counter()
+    restarts0 = _ENGINE_RESTARTS
     while True:
         if board.is_game_over(claim_draw=True):
             result = board.result(claim_draw=True)
             break
         if len(board.move_stack) - len(opening["moves"]) >= MAX_PLIES:
-            info = analyse(_ENGINE, board, depth=ADJ_DEPTH)
+            info = _analyse_adj(board)
             cp = info["score"].white().score(mate_score=MATE_SCORE)
             result = "1-0" if cp >= 200 else "0-1" if cp <= -200 else "1/2-1/2"
             break
@@ -331,6 +480,10 @@ def _play_game(task):
         # of a pair run in different workers, so builtin hash would never match.
         "fp": zlib.crc32(" ".join(moves_played).encode()),
         "s": round(time.perf_counter() - t0, 1),
+        # Adjudicator restarts during THIS game. Reported rather than swallowed: a game
+        # played through a restarted adjudicator is still valid, but a run where this is
+        # not near zero is a run whose environment is unhealthy.
+        "adj_restarts": _ENGINE_RESTARTS - restarts0,
     }
 
 
@@ -441,6 +594,12 @@ def cmd_h2h(a_spec, b_spec, n_pairs, workers, threads, a_model=None, b_model=Non
         print(f"\n  note: {twins}/{complete} pairs played identical games "
               f"(expected when the arms agree on every move)")
 
+    restarts = sum(g.get("adj_restarts", 0) for g in games)
+    if restarts:
+        print(f"\n  note: the adjudicator died and was restarted {restarts} time(s) across "
+              f"{len(games)} games.\n  Games are still valid (the adjudicator is common to "
+              f"both arms), but this is not normal.")
+
     white_wins = sum(1 for g in games if g["result"] == "1-0")
     black_wins = sum(1 for g in games if g["result"] == "0-1")
     draws = sum(1 for g in games if g["result"] == "1/2-1/2")
@@ -539,7 +698,12 @@ def cmd_variants():
     print("engine variants available as arms (NAME:SIMS):\n")
     for name, fn in VARIANTS.items():
         doc = (fn.__doc__ or "").strip().splitlines()[0]
+        cfg = VARIANT_CONFIG.get(name)
         print(f"  {name:<12} {doc}")
+        if cfg:
+            print(f"  {'':<12} config: {cfg}")
+    print("\n  the vh-* arms need a model with a usable value head:")
+    print("    --a-model models/dual_model_v2_fp32.onnx --b-model models/dual_model_v2_fp32.onnx")
 
 
 def main():
