@@ -36,6 +36,11 @@ bench/results/
 # arms run on the identical frozen position set, so the suite must be shared and stable
 # across commits and machines — rebuilding it silently invalidates every prior number.
 
+# Only the SERVED model is tracked. Experimental exports are 18MB each and would
+# accumulate in history forever — an unadopted one already slipped in via `git add -A`.
+models/*.onnx
+!models/dual_model_mcts_fp32.onnx
+
 # NOTE: models/dual_model_mcts_fp32.onnx is deliberately TRACKED, not ignored. It is
 # the artifact the web server actually serves, and keeping it in the repo is what makes
 # a clone-based deploy work — see bench/test_deploy.py. Torch checkpoints (*.pt) stay

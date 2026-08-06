@@ -141,9 +141,20 @@ def _prepare_variants(names):
     _ACTIVE = None
 
 
-def activate(name):
-    """Make `name` the engine that the next select_move call will use."""
+def activate(name, arm_key=None):
+    """
+    Make `name` (and optionally arm_key's model) what the next select_move uses.
+
+    Both the variant patches and the ONNX session are process-global, so an arm is
+    selected immediately before its move rather than configured once at startup.
+    """
     global _ACTIVE
+    if arm_key is not None and arm_key in _ARM_SESSION:
+        # Point the cached inference session at this arm's model. get_onnx_session()
+        # returns _ort_session once _ort_resolved is set, so this is the whole swap.
+        import inference
+        inference._ort_resolved = True
+        inference._ort_session = _ARM_SESSION[arm_key]
     if name == _ACTIVE:
         return
     import mcts as M
@@ -187,9 +198,10 @@ _ARM_VARIANT = {}
 _SF_OPPONENT = None
 _SF_MOVETIME = 0.1
 _OPP_KEY = "b"
+_ARM_SESSION = {}
 
 
-def _init_worker(arms, threads, sf_elo=None, sf_movetime=0.1):
+def _init_worker(arms, threads, sf_elo=None, sf_movetime=0.1, models=None):
     """arms: {'a': (variant, sims), ...}. 'sf' is a reserved arm key for Stockfish."""
     global _ENGINE, _PLAYERS, _ARM_VARIANT, _SF_OPPONENT, _SF_MOVETIME, _OPP_KEY
     os.environ["CHESS_NUM_THREADS"] = str(threads)
@@ -221,6 +233,13 @@ def _init_worker(arms, threads, sf_elo=None, sf_movetime=0.1):
         model = load_dual_model(DEFAULT_CKPT_PATH)
     if session is None and model is None:
         raise RuntimeError("no model available; refusing to measure a random policy")
+
+    # Per-arm models, so two CHECKPOINTS can be compared, not just two code variants.
+    if models:
+        from inference import OnnxPolicyValue
+        for key, path in models.items():
+            if path:
+                _ARM_SESSION[key] = OnnxPolicyValue(path, threads=threads)
 
     from mcts import MCTSPlayer, MCTSConfig
     for key, (variant, sims) in arms.items():
@@ -279,7 +298,7 @@ def _play_game(task):
             move = _SF_OPPONENT.play(
                 board, chess.engine.Limit(time=_SF_MOVETIME)).move
         else:
-            activate(_ARM_VARIANT[key])  # per-move: variants are process-global
+            activate(_ARM_VARIANT[key], key)  # per-move: variant AND model are global
             move = _PLAYERS[key].select_move(board)
         if move is None:
             result = "1/2-1/2"
@@ -370,11 +389,12 @@ def _tally(games):
 # Commands
 # ---------------------------------------------------------------------------
 
-def _run(tasks, arms, workers, threads, label, sf_elo=None, sf_movetime=0.1):
+def _run(tasks, arms, workers, threads, label, sf_elo=None, sf_movetime=0.1,
+         models=None):
     t0 = time.perf_counter()
     out = []
     with Pool(workers, initializer=_init_worker,
-              initargs=(arms, threads, sf_elo, sf_movetime)) as pool:
+              initargs=(arms, threads, sf_elo, sf_movetime, models)) as pool:
         for i, g in enumerate(pool.imap_unordered(_play_game, tasks), 1):
             out.append(g)
             if i % 10 == 0 or i == len(tasks):
@@ -385,8 +405,9 @@ def _run(tasks, arms, workers, threads, label, sf_elo=None, sf_movetime=0.1):
     return out, time.perf_counter() - t0
 
 
-def cmd_h2h(a_spec, b_spec, n_pairs, workers, threads):
+def cmd_h2h(a_spec, b_spec, n_pairs, workers, threads, a_model=None, b_model=None):
     a, b = parse_arm(a_spec), parse_arm(b_spec)
+    models = {"a": a_model, "b": b_model} if (a_model or b_model) else None
     openings = build_openings(n_pairs)
     # Each opening twice, colours reversed.
     tasks = []
@@ -397,7 +418,10 @@ def cmd_h2h(a_spec, b_spec, n_pairs, workers, threads):
     print(f"Head-to-head: A={a_spec}  vs  B={b_spec}")
     print(f"  {len(openings)} openings x 2 colours = {len(tasks)} games, "
           f"{workers} workers x {threads} thread(s)")
-    games, dt = _run(tasks, {"a": a, "b": b}, workers, threads, "h2h")
+    if models:
+        print(f"  A model: {a_model or 'default'}")
+        print(f"  B model: {b_model or 'default'}")
+    games, dt = _run(tasks, {"a": a, "b": b}, workers, threads, "h2h", models=models)
 
     st = pair_stats(games)
     w, d, l = _tally(games)
@@ -426,7 +450,8 @@ def cmd_h2h(a_spec, b_spec, n_pairs, workers, threads):
     out = {"a": a_spec, "b": b_spec, "games": len(games), "wdl": [w, d, l],
            "stats": st, "wall_s": round(dt, 1), "rows": games}
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    name = f"elo_{a[0]}{a[1]}_vs_{b[0]}{b[1]}"
+    tag = "_models" if models else ""
+    name = f"elo_{a[0]}{a[1]}_vs_{b[0]}{b[1]}{tag}"
     with open(os.path.join(RESULTS_DIR, f"{name}.json"), "w") as f:
         json.dump(out, f)
 
@@ -528,6 +553,10 @@ def main():
     h.add_argument("--pairs", type=int, default=100)
     h.add_argument("--workers", type=int, default=None)
     h.add_argument("--threads", type=int, default=2)
+    h.add_argument("--a-model", default=None,
+                   help="ONNX model for arm A (default: the shipped one)")
+    h.add_argument("--b-model", default=None,
+                   help="ONNX model for arm B, e.g. models/dual_model_v2_fp32.onnx")
 
     g = sub.add_parser("gauntlet", help="engine vs Stockfish at calibrated UCI_Elo")
     g.add_argument("--a", required=True, help="engine arm as VARIANT:SIMS")
@@ -554,7 +583,8 @@ def main():
         elos = [int(x) for x in args.elos.split(",")]
         cmd_gauntlet(args.a, elos, args.pairs, args.workers, args.threads, args.movetime)
     else:
-        cmd_h2h(args.a, args.b, args.pairs, args.workers, args.threads)
+        cmd_h2h(args.a, args.b, args.pairs, args.workers, args.threads,
+                args.a_model, args.b_model)
 
 
 if __name__ == "__main__":
