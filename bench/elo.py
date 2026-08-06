@@ -184,12 +184,27 @@ def build_openings(n):
 _ENGINE = None
 _PLAYERS = {}
 _ARM_VARIANT = {}
+_SF_OPPONENT = None
+_SF_MOVETIME = 0.1
+_OPP_KEY = "b"
 
 
-def _init_worker(arms, threads):
-    """arms: {'a': (variant, sims), 'b': (variant, sims)}."""
-    global _ENGINE, _PLAYERS, _ARM_VARIANT
+def _init_worker(arms, threads, sf_elo=None, sf_movetime=0.1):
+    """arms: {'a': (variant, sims), ...}. 'sf' is a reserved arm key for Stockfish."""
+    global _ENGINE, _PLAYERS, _ARM_VARIANT, _SF_OPPONENT, _SF_MOVETIME, _OPP_KEY
     os.environ["CHESS_NUM_THREADS"] = str(threads)
+    _SF_MOVETIME = sf_movetime
+    # Arm 'a' is always the engine under test; its opponent is either the second engine
+    # arm 'b' (h2h) or Stockfish (gauntlet).
+    _OPP_KEY = "sf" if "sf" in arms else "b"
+
+    if sf_elo is not None:
+        # A SECOND Stockfish, deliberately weakened. Kept separate from the adjudicator
+        # below, which must stay full strength — sharing one process would silently
+        # adjudicate every game with a 1320-rated engine.
+        _SF_OPPONENT = chess.engine.SimpleEngine.popen_uci(SF_PATH)
+        _SF_OPPONENT.configure({"Threads": 1, "Hash": 16,
+                                "UCI_LimitStrength": True, "UCI_Elo": sf_elo})
 
     _ARM_VARIANT = {k: v for k, (v, _) in arms.items()}
     _prepare_variants(set(_ARM_VARIANT.values()))
@@ -209,6 +224,8 @@ def _init_worker(arms, threads):
 
     from mcts import MCTSPlayer, MCTSConfig
     for key, (variant, sims) in arms.items():
+        if key == "sf":
+            continue
         _PLAYERS[key] = MCTSPlayer(
             model=model,
             config=MCTSConfig(num_simulations=sims, temperature=0, add_noise=False))
@@ -241,7 +258,7 @@ def _play_game(task):
     """Play one game. Returns the score for arm 'a' in {0, 0.5, 1}."""
     opening, a_is_white, opening_idx = task
     board = rebuild(opening["moves"])
-    white_key, black_key = ("a", "b") if a_is_white else ("b", "a")
+    white_key, black_key = (("a", _OPP_KEY) if a_is_white else (_OPP_KEY, "a"))
 
     history = []
     moves_played = []
@@ -258,8 +275,12 @@ def _play_game(task):
             break
 
         key = white_key if board.turn == chess.WHITE else black_key
-        activate(_ARM_VARIANT[key])      # per-move: variants are process-global
-        move = _PLAYERS[key].select_move(board)
+        if key == "sf":
+            move = _SF_OPPONENT.play(
+                board, chess.engine.Limit(time=_SF_MOVETIME)).move
+        else:
+            activate(_ARM_VARIANT[key])  # per-move: variants are process-global
+            move = _PLAYERS[key].select_move(board)
         if move is None:
             result = "1/2-1/2"
             break
@@ -349,10 +370,11 @@ def _tally(games):
 # Commands
 # ---------------------------------------------------------------------------
 
-def _run(tasks, arms, workers, threads, label):
+def _run(tasks, arms, workers, threads, label, sf_elo=None, sf_movetime=0.1):
     t0 = time.perf_counter()
     out = []
-    with Pool(workers, initializer=_init_worker, initargs=(arms, threads)) as pool:
+    with Pool(workers, initializer=_init_worker,
+              initargs=(arms, threads, sf_elo, sf_movetime)) as pool:
         for i, g in enumerate(pool.imap_unordered(_play_game, tasks), 1):
             out.append(g)
             if i % 10 == 0 or i == len(tasks):
@@ -422,6 +444,72 @@ def cmd_h2h(a_spec, b_spec, n_pairs, workers, threads):
     return out
 
 
+def cmd_gauntlet(a_spec, elos, n_pairs, workers, threads, movetime):
+    """Play the engine against Stockfish at calibrated UCI_Elo levels."""
+    a = parse_arm(a_spec)
+    openings = build_openings(n_pairs)
+    print(f"Gauntlet: {a_spec} vs Stockfish at UCI_Elo {elos}")
+    print(f"  {len(openings)} openings x 2 colours per level, "
+          f"Stockfish {movetime * 1000:.0f} ms/move\n")
+
+    rows = []
+    for sf_elo in elos:
+        tasks = []
+        for i, o in enumerate(openings):
+            tasks.append((o, True, i))
+            tasks.append((o, False, i))
+        print(f"  --- vs UCI_Elo {sf_elo} ---")
+        games, dt = _run(tasks, {"a": a, "sf": ("current", 0)}, workers, threads,
+                         "gauntlet", sf_elo, movetime)
+        st = pair_stats(games)
+        w, d, l = _tally(games)
+        implied = None
+        if st and 0.0 < st["score"] < 1.0:
+            implied = sf_elo + st["elo"]
+        # Keep the per-game records. Without them an odd aggregate cannot be diagnosed:
+        # two gauntlet runs once returned an identical +12 =1 -37 and the only way to
+        # show it was coincidence rather than a bug was that their standard errors
+        # differed — which needed the pair-level data, not the summary.
+        rows.append({"sf_elo": sf_elo, "wdl": [w, d, l], "stats": st,
+                     "implied_elo": implied, "wall_s": round(dt, 1), "games": games})
+        score = (w + 0.5 * d) / len(games)
+        print(f"  +{w} ={d} -{l}  score {score:.1%}"
+              + (f"   implied engine Elo ~{implied:.0f}" if implied is not None
+                 else "   (shutout: engine Elo is outside this level's range)"))
+        print()
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    name = f"gauntlet_{a[0]}{a[1]}"
+    with open(os.path.join(RESULTS_DIR, f"{name}.json"), "w") as f:
+        json.dump({"a": a_spec, "movetime": movetime, "rows": rows}, f)
+
+    usable = [r for r in rows if r["implied_elo"] is not None]
+    print("=" * 66)
+    if usable:
+        # Inverse-variance weight, using each level's Elo standard error.
+        tot_w = tot = 0.0
+        for r in usable:
+            se_elo = max(1.0, (r["stats"]["elo_hi"] - r["stats"]["elo_lo"]) / 3.92)
+            wt = 1.0 / (se_elo ** 2)
+            tot += wt * r["implied_elo"]
+            tot_w += wt
+        print(f"  ESTIMATED ENGINE RATING: ~{tot / tot_w:.0f} Elo")
+        for r in usable:
+            print(f"    vs {r['sf_elo']}: implied {r['implied_elo']:.0f}")
+    else:
+        lo = min(r["sf_elo"] for r in rows)
+        allzero = all((r["wdl"][0] + 0.5 * r["wdl"][1]) == 0 for r in rows)
+        print(f"  No level produced a usable estimate — the engine "
+              f"{'lost every game' if allzero else 'won every game'}.")
+        print(f"  Its rating is {'below' if allzero else 'above'} the levels tested "
+              f"(lowest was {lo}).")
+    print("\n  CAVEAT: UCI_Elo is calibrated for standard time controls. At "
+          f"{movetime * 1000:.0f} ms/move Stockfish plays BELOW its nominal rating, so "
+          "this\n  anchor flatters the engine and should be read as a soft upper bound. "
+          "The\n  engine-vs-engine Elo differences from `h2h` do not have this problem.")
+    return rows
+
+
 def cmd_variants():
     print("engine variants available as arms (NAME:SIMS):\n")
     for name, fn in VARIANTS.items():
@@ -441,6 +529,16 @@ def main():
     h.add_argument("--workers", type=int, default=None)
     h.add_argument("--threads", type=int, default=2)
 
+    g = sub.add_parser("gauntlet", help="engine vs Stockfish at calibrated UCI_Elo")
+    g.add_argument("--a", required=True, help="engine arm as VARIANT:SIMS")
+    g.add_argument("--elos", default="1320,1500,1700",
+                   help="comma-separated Stockfish UCI_Elo levels (min 1320)")
+    g.add_argument("--pairs", type=int, default=25)
+    g.add_argument("--workers", type=int, default=None)
+    g.add_argument("--threads", type=int, default=2)
+    g.add_argument("--movetime", type=float, default=0.1,
+                   help="seconds per Stockfish move")
+
     sub.add_parser("variants", help="list engine variants")
 
     args = ap.parse_args()
@@ -452,7 +550,11 @@ def main():
         args.workers = max(1, (cores - 2) // max(1, args.threads))
         print(f"(using {args.workers} workers x {args.threads} thread(s) "
               f"on {cores} logical cores)")
-    cmd_h2h(args.a, args.b, args.pairs, args.workers, args.threads)
+    if args.cmd == "gauntlet":
+        elos = [int(x) for x in args.elos.split(",")]
+        cmd_gauntlet(args.a, elos, args.pairs, args.workers, args.threads, args.movetime)
+    else:
+        cmd_h2h(args.a, args.b, args.pairs, args.workers, args.threads)
 
 
 if __name__ == "__main__":
