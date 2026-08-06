@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+
 import math
 import os
 import sys
@@ -76,9 +77,14 @@ TRAIN_EPOCHS = 3  # Fewer epochs per batch to avoid memorization
 
 # Difficulty progression
 # Start with intermediate Stockfish since model already plays well
-INITIAL_ELO = 1400  # Starting strength (intermediate - model already beats casual players)
-FINAL_ELO = 2000  # Target strength (strong club player)
-ELO_INCREASE_INTERVAL = 15  # Increase ELO every N iterations
+# Teacher: full-strength Stockfish at a fixed depth. There is no ELO curriculum any
+# more — that existed only to drive Skill Level, which was the source of the label
+# noise. Measured trade-off per position (self-consistency is 40/40 at every depth):
+#     depth  8:   7.4 ms,  67.5% agreement with a depth-18 reference
+#     depth 10:  13.4 ms,  72.5%
+#     depth 12:  25.6 ms,  77.5%      <- default
+#     depth 14:  54.0 ms,  82.5%
+TEACHER_DEPTH = 12
 
 # Architecture (set by CLI arg)
 USE_CNN = True  # True = DualNetCNN, False = DualNet MLP
@@ -124,11 +130,29 @@ def clear_memory():
 # ==================== Stockfish Interface ====================
 
 class StockfishTeacher:
-    """Interface to Stockfish chess engine for training."""
+    """
+    Full-strength Stockfish at a FIXED DEPTH, queried deterministically.
 
-    def __init__(self, path=STOCKFISH_PATH, elo=1500):
+    This replaces a teacher configured with `Skill Level`, derived from a nominal ELO.
+    Skill Level is deliberately stochastic, and it was bad on every axis at once —
+    measured over 40 suite positions:
+
+                                ms/pos   reproduces own move   agrees with depth-18
+        old: Skill 12, 0.15s     151.3          18/40                 47.5%
+        new: full, depth 12       25.6          40/40                 77.5%
+
+    So roughly 55% of every policy label used to be noise that no network could fit,
+    and the labels that were stable still disagreed with a strong reference more often
+    than not. The replacement is 5.9x CHEAPER as well, which is why this doubles as a
+    throughput change.
+
+    Determinism additionally requires ucinewgame before each query: without it the
+    transposition table persists and the same position can return a different move.
+    """
+
+    def __init__(self, path=STOCKFISH_PATH, depth=None):
         self.path = path
-        self.elo = elo
+        self.depth = depth or TEACHER_DEPTH
         self.engine = None
         self._connect()
 
@@ -136,24 +160,13 @@ class StockfishTeacher:
         """Connect to Stockfish engine."""
         try:
             self.engine = chess.engine.SimpleEngine.popen_uci(self.path)
-
-            # Set skill level based on ELO
-            # Stockfish skill levels: 0-20
-            # Approximate mapping: ELO 800-2800 -> Skill 0-20
-            skill = max(0, min(20, int((self.elo - 800) / 100)))
-            self.engine.configure({"Skill Level": skill})
-
-            log(f"Connected to Stockfish (ELO ~{self.elo}, Skill {skill})")
+            # No Skill Level and no UCI_LimitStrength: full strength, capped by depth.
+            self.engine.configure({"Threads": 1, "Hash": 32})
+            log(f"Connected to Stockfish (full strength, fixed depth {self.depth})")
         except Exception as e:
             log(f"ERROR: Could not connect to Stockfish: {e}")
             log(f"Make sure stockfish.exe is in: {os.path.abspath(self.path)}")
             raise
-
-    def set_elo(self, elo):
-        """Update Stockfish strength."""
-        self.elo = elo
-        skill = max(0, min(20, int((elo - 800) / 100)))
-        self.engine.configure({"Skill Level": skill})
 
     def get_best_move(self, board, time_limit=STOCKFISH_TIME_LIMIT):
         """Get Stockfish's best move for a position."""
@@ -164,24 +177,22 @@ class StockfishTeacher:
             log(f"Warning: Stockfish error: {e}")
             return None
 
-    def get_move_and_eval(self, board, time_limit=STOCKFISH_TIME_LIMIT):
+    def get_move_and_eval(self, board):
         """
-        Return (best_move, eval_in_pawns) from a SINGLE search.
+        Return (best_move, eval_in_pawns) from a SINGLE deterministic search.
 
-        Replaces calling get_best_move() and then evaluate_position() on the same board,
-        which ran two full Stockfish searches per training position and accounted for
-        ~35% of every iteration. `info=INFO_SCORE` makes play() report the root score it
-        already computed, so the second search is pure waste.
+        One search, not two: this replaced calling get_best_move() and then
+        evaluate_position() on the same board, which ran two full searches per training
+        position. `info=INFO_SCORE` reports the root score the search already computed.
 
-        The score comes from a time-limited search rather than the old fixed depth-12
-        analyse, so the value target shifts slightly. That is well inside the teacher's
-        own noise: this teacher uses Skill Level, which is deliberately stochastic and
-        reproduces its own move only ~40-50% of the time on a repeated query.
+        `game=object()` forces ucinewgame, clearing the transposition table so the same
+        position always returns the same label. Without it the teacher contradicts
+        itself across iterations and the network is asked to fit the difference.
         """
         try:
             result = self.engine.play(
-                board, chess.engine.Limit(time=time_limit),
-                info=chess.engine.INFO_SCORE)
+                board, chess.engine.Limit(depth=self.depth),
+                info=chess.engine.INFO_SCORE, game=object())
             score = result.info.get("score")
             cp = score.relative.score(mate_score=10000) if score else None
             return result.move, (cp / 100.0 if cp is not None else 0.0)
@@ -507,20 +518,53 @@ def generate_imitation_data(stockfish, num_positions=200):
 _POOL_TEACHER = None
 
 
-def _teacher_init(elo):
+def _teacher_init(depth):
     global _POOL_TEACHER
-    _POOL_TEACHER = StockfishTeacher(STOCKFISH_PATH, elo=elo)
+    _POOL_TEACHER = StockfishTeacher(STOCKFISH_PATH, depth=depth)
+
+
+def _teacher_shutdown(_):
+    """
+    Quit this worker's Stockfish while the worker is still alive.
+
+    atexit does NOT work for this. python-chess drives the engine from a background
+    event loop, and by the time atexit handlers run that loop is already gone, so
+    engine.quit() raises EngineTerminatedError("engine event loop dead") and the
+    Stockfish child is orphaned. One run left 8 stray stockfish.exe processes behind,
+    and they accumulate across runs. Shutting down as a normal task avoids that,
+    because the worker is fully alive when it happens.
+    """
+    global _POOL_TEACHER
+    if _POOL_TEACHER is not None:
+        try:
+            _POOL_TEACHER.close()
+        except Exception:
+            pass
+        _POOL_TEACHER = None
+    # Stay busy briefly so the next shutdown task is handed to a DIFFERENT worker
+    # rather than being picked up again by this one.
+    time.sleep(0.2)
+    return True
+
+
+def close_teacher_pool(pool, workers):
+    """Ask every worker to quit its engine, then shut the pool down."""
+    try:
+        pool.map(_teacher_shutdown, range(workers * 2), chunksize=1)
+    except Exception:
+        pass
+    try:
+        pool.close()
+        pool.join()
+    except Exception:
+        pool.terminate()
+        pool.join()
 
 
 def _teacher_game(args):
     """Generate ONE game's worth of positions. Runs in a pool worker."""
-    seed, elo = args
+    seed = args
     random.seed(seed)
-    # The curriculum raises Stockfish's strength as training proceeds. The pool is
-    # long-lived, so each worker retunes its own engine when the target moves rather
-    # than the pool being torn down and rebuilt.
-    if _POOL_TEACHER is not None and _POOL_TEACHER.elo != elo:
-        _POOL_TEACHER.set_elo(elo)
     try:
         # num_positions=20 is exactly one game in generate_imitation_data's own terms
         # (it runs num_positions // 20 games), so the parallel and serial paths produce
@@ -530,7 +574,7 @@ def _teacher_game(args):
         return []
 
 
-def make_teacher_pool(workers, elo):
+def make_teacher_pool(workers, depth):
     """
     Create the teacher pool ONCE, for the whole run.
 
@@ -539,10 +583,10 @@ def make_teacher_pool(workers, elo):
     on startup, plus eight "Connected to Stockfish" lines per iteration in the log.
     """
     from multiprocessing import Pool
-    return Pool(workers, initializer=_teacher_init, initargs=(elo,))
+    return Pool(workers, initializer=_teacher_init, initargs=(depth,))
 
 
-def generate_imitation_data_parallel(num_positions, elo, pool):
+def generate_imitation_data_parallel(num_positions, pool):
     """
     The same data generate_imitation_data would produce, spread over a teacher pool —
     one game per task, since positions within a game are strictly sequential.
@@ -557,11 +601,76 @@ def generate_imitation_data_parallel(num_positions, elo, pool):
     worse past the physical core count.
     """
     n_games = max(1, num_positions // 20)
-    tasks = [(random.randrange(1 << 30), elo) for _ in range(n_games)]
+    tasks = [random.randrange(1 << 30) for _ in range(n_games)]
     out = []
     for chunk in pool.imap_unordered(_teacher_game, tasks):
         out.extend(chunk)
     return out
+
+
+# ==================== Held-out validation ====================
+#
+# The p_loss in the iteration log is the THIRD epoch's loss on the very positions just
+# trained on — an in-sample number that cannot distinguish learning from memorising, and
+# cannot go up when the model overfits. The April run logged a flat ~3.0 for 13.7 hours
+# and nobody could tell it had learned nothing after the first ~2.5.
+#
+# This set is generated once, cached to disk, and NEVER trained on. It is the only
+# number in the loop that answers "is the network actually getting better".
+
+VAL_POSITIONS = 400
+VAL_INTERVAL = 10
+VAL_CACHE = "data/training/validation_set.npz"
+
+
+def build_validation_set(pool, teachers, n=VAL_POSITIONS):
+    """Generate (or load) a fixed held-out set, labelled by the same teacher."""
+    cache = Path(VAL_CACHE)
+    if cache.exists():
+        d = np.load(cache)
+        data = list(zip(d["x"], d["policy"], d["value"]))
+        log(f"Validation set: {len(data)} cached positions from {cache}")
+        return data
+
+    log(f"Validation set: generating {n} held-out positions (one time, then cached)...")
+    # A distinct seed keeps these positions out of the training stream. They are drawn
+    # from the same generator, so this measures generalisation on the task being
+    # trained, not transfer to a different distribution.
+    random.seed(987654321)
+    data = (generate_imitation_data_parallel(n, pool) if pool is not None
+            else generate_imitation_data(StockfishTeacher(STOCKFISH_PATH), n))
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        cache,
+        x=np.array([d[0] for d in data], dtype=np.float32),
+        policy=np.array([d[1] for d in data], dtype=np.float32),
+        value=np.array([d[2] for d in data], dtype=np.float32))
+    log(f"Validation set: cached {len(data)} positions to {cache}")
+    return data
+
+
+def evaluate_validation(model, val_data, device):
+    """Return (top1 accuracy, policy NLL, value MSE) on the held-out set."""
+    if not val_data:
+        return 0.0, 0.0, 0.0
+    model.eval()
+    xs = torch.tensor(np.array([d[0] for d in val_data]), dtype=torch.float32, device=device)
+    ps = torch.tensor(np.array([d[1] for d in val_data]), dtype=torch.float32, device=device)
+    vs = torch.tensor(np.array([d[2] for d in val_data]), dtype=torch.float32, device=device)
+    correct = total = 0
+    nll_sum = mse_sum = 0.0
+    with torch.no_grad():
+        for i in range(0, len(val_data), BATCH_SIZE):
+            xb, pb, vb = xs[i:i + BATCH_SIZE], ps[i:i + BATCH_SIZE], vs[i:i + BATCH_SIZE]
+            logits, value = model(xb)
+            target = pb.argmax(dim=1)
+            nll_sum += nn.functional.cross_entropy(
+                logits, target, reduction="sum").item()
+            correct += (logits.argmax(dim=1) == target).sum().item()
+            mse_sum += ((value.squeeze(-1) - vb) ** 2).sum().item()
+            total += xb.size(0)
+    model.train()
+    return correct / total, nll_sum / total, mse_sum / total
 
 
 # ==================== Training ====================
@@ -622,7 +731,8 @@ def train_epoch(model, optimizer, training_data, device):
 
 # ==================== Main Training Loop ====================
 
-def run_training(hours, model_path, mode="imitation", teachers=1, allow_fresh=False):
+def run_training(hours, model_path, mode="imitation", teachers=1, allow_fresh=False,
+                 buffer_size=8000):
     """Main training function."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -678,27 +788,32 @@ def run_training(hours, model_path, mode="imitation", teachers=1, allow_fresh=Fa
     del _ck
 
     log(f"Teacher processes: {teachers}")
-    stockfish = StockfishTeacher(STOCKFISH_PATH, elo=INITIAL_ELO)
-    teacher_pool = make_teacher_pool(teachers, INITIAL_ELO) if teachers > 1 else None
+    stockfish = StockfishTeacher(STOCKFISH_PATH, depth=TEACHER_DEPTH)
+    teacher_pool = make_teacher_pool(teachers, TEACHER_DEPTH) if teachers > 1 else None
+    val_data = build_validation_set(teacher_pool, teachers)
+
+    # Replay buffer. Previously each iteration generated ~400 fresh positions, ran 3
+    # epochs on them and threw them away — a memorise-then-forget cycle in which a
+    # 4.6M-parameter network sees every example exactly three times. Keeping a window
+    # lets each expensively-labelled position contribute to many updates.
+    from collections import deque
+    replay = deque(maxlen=buffer_size) if buffer_size else None
+
+    # Decay the learning rate. It was fixed at 5e-4 for the entire 13.7h run.
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(10, int(hours * 3600 / 10)), eta_min=LEARNING_RATE / 20)
 
     log(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    log(f"Initial Stockfish ELO: {INITIAL_ELO}")
+    log(f"Teacher: full-strength Stockfish, fixed depth {TEACHER_DEPTH}")
 
     # Training loop
     iteration = 0
     total_positions = 0
     start_time = datetime.now()
-    current_elo = INITIAL_ELO
 
     try:
         while datetime.now() < end_time:
             iteration += 1
-
-            # Gradually increase Stockfish strength
-            if iteration % ELO_INCREASE_INTERVAL == 0 and current_elo < FINAL_ELO:
-                current_elo = min(FINAL_ELO, current_elo + 100)
-                stockfish.set_elo(current_elo)
-                log(f"Increased Stockfish ELO to {current_elo}")
 
             training_data = []
             model_wins = 0
@@ -710,7 +825,7 @@ def run_training(hours, model_path, mode="imitation", teachers=1, allow_fresh=Fa
                 # Pure imitation learning from Stockfish self-play
                 if teacher_pool is not None:
                     training_data = generate_imitation_data_parallel(
-                        200, current_elo, teacher_pool)
+                        200, teacher_pool)
                 else:
                     training_data = generate_imitation_data(stockfish, num_positions=200)
             else:
@@ -732,20 +847,38 @@ def run_training(hours, model_path, mode="imitation", teachers=1, allow_fresh=Fa
             total_positions += len(training_data)
             gen_s = time.time() - _t_gen
 
-            # Train
+            # Mix fresh positions into the replay window.
+            if replay is not None:
+                replay.extend(training_data)
+                window = list(replay)
+            else:
+                window = training_data
+
+            # Train on a fixed-size SAMPLE of the window, not the whole window.
+            # Training on everything makes per-iteration cost grow with the buffer —
+            # measured 4.8s, 9.7, 14.5, 19.5, 24.4, 29.9s over six iterations, which at
+            # an 8000-position window would be ~20x the intended work. Sampling keeps
+            # compute per iteration constant while still drawing on the whole history,
+            # and re-sampling per epoch varies what each pass sees.
+            n_sample = min(len(training_data), len(window)) or len(window)
             _t_train = time.time()
-            if training_data:
+            if window:
                 for epoch in range(TRAIN_EPOCHS):
-                    losses = train_epoch(model, optimizer, training_data, device)
+                    batch = (random.sample(window, n_sample)
+                             if len(window) > n_sample else window)
+                    losses = train_epoch(model, optimizer, batch, device)
+                scheduler.step()
                 train_s = time.time() - _t_train
 
                 if mode == "imitation":
                     # gen/train split is logged because it is what decides where the
                     # next optimisation should go: teacher parallelism only helps while
                     # generation dominates, and GPU training only helps once it does not.
-                    log(f"Iter {iteration}: {len(training_data)} positions, "
+                    log(f"Iter {iteration}: {len(training_data)} fresh"
+                        f"{f'/{len(window)} buf' if replay is not None else ''}, "
                         f"p_loss={losses['policy_loss']:.3f}, v_loss={losses['value_loss']:.3f}, "
-                        f"SF_ELO={current_elo}, gen={gen_s:.1f}s train={train_s:.1f}s")
+                        f"lr={scheduler.get_last_lr()[0]:.2e}, "
+                        f"gen={gen_s:.1f}s train={train_s:.1f}s")
                 else:
                     log(f"Iter {iteration}: {len(training_data)} positions, "
                         f"W/L/D={model_wins}/{model_losses}/{draws}, "
@@ -760,6 +893,13 @@ def run_training(hours, model_path, mode="imitation", teachers=1, allow_fresh=Fa
                 checkpoint_path = data_dir / f"sf_checkpoint_iter{iteration}.pt"
                 save_model(model, checkpoint_path)
                 log(f"Checkpoint saved: {checkpoint_path.name}")
+
+            # Held-out validation — the only number here that can fall as well as rise,
+            # and the only one that distinguishes learning from memorising.
+            if iteration % VAL_INTERVAL == 0:
+                top1, nll, vmse = evaluate_validation(model, val_data, device)
+                log(f"  VALIDATION iter {iteration}: top1={top1:.1%} "
+                    f"policy_nll={nll:.3f} value_mse={vmse:.4f}")
 
             # Memory cleanup
             if iteration % 5 == 0:
@@ -783,10 +923,12 @@ def run_training(hours, model_path, mode="imitation", teachers=1, allow_fresh=Fa
         raise
 
     finally:
-        stockfish.close()
+        try:
+            stockfish.close()
+        except Exception:
+            pass
         if teacher_pool is not None:
-            teacher_pool.terminate()
-            teacher_pool.join()
+            close_teacher_pool(teacher_pool, teachers)
 
     # Final save
     save_model(model, model_path, optimizer, iteration, total_positions)
@@ -797,7 +939,7 @@ def run_training(hours, model_path, mode="imitation", teachers=1, allow_fresh=Fa
     log("=" * 60)
     log(f"Total iterations: {iteration}")
     log(f"Total positions learned: {total_positions}")
-    log(f"Final Stockfish ELO: {current_elo}")
+    log(f"Teacher depth: {TEACHER_DEPTH}")
     log(f"Model saved: {model_path}")
     log("=" * 60)
     log("")
@@ -821,6 +963,11 @@ def main():
                              "is ~94%% of an iteration and was single-process. Each "
                              "engine is ~250MB resident, so this is a memory decision "
                              "as much as a speed one; 1 restores the old behaviour.")
+    parser.add_argument("--buffer", type=int, default=8000,
+                        help="Replay buffer size in positions (0 disables). Each "
+                             "iteration previously trained 3 epochs on ~400 fresh "
+                             "positions and discarded them, so every expensively "
+                             "labelled position was seen exactly three times.")
     parser.add_argument("--fresh", action="store_true",
                         help="Start from random weights ON PURPOSE. Without this, a "
                              "missing or mismatched checkpoint is a fatal error rather "
@@ -828,7 +975,8 @@ def main():
     args = parser.parse_args()
 
     USE_CNN = (args.arch == "cnn")
-    run_training(args.hours, args.model, args.mode, args.teachers, args.fresh)
+    run_training(args.hours, args.model, args.mode, args.teachers, args.fresh,
+                 args.buffer)
 
 
 if __name__ == "__main__":
