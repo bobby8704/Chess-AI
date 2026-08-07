@@ -264,11 +264,14 @@ VARIANT_CONFIG = {
     # idle-box calibration would hand the timed arm a silent sim deficit, because a
     # timed arm is the one thing h2h's timing-independence does not cover. The ms_a /
     # ms_b fields in every results row are the receipt that the match actually held.
-    # 0.455 = the fixed current:100 arm's measured 497ms in-harness move time, minus
-    # the ~42ms that select_move spends outside the sim loop (root pipeline, vetoes),
-    # both numbers from the 6-pair calibration run. Idle-box latency for the same arm
-    # is 241ms — calibrating from THAT would have starved the timed arm by ~40%.
-    "timed": {"time_budget_s": 0.455},
+    # 0.40 = the fixed current:100 arm's 443ms move time as measured over the FULL
+    # 240-pair run (elo_timed1300_vs_current100_models.json ms_b), minus the ~42ms
+    # select_move spends outside the sim loop. The first calibration used a 6-pair
+    # estimate of 497ms that ran ~12% high — worth ~+21 Elo of pure time advantage,
+    # which is why the first 240-pair result (+45.1) cannot be read as reallocation
+    # alone. Idle-box latency for the same arm is 241ms; calibrating from THAT would
+    # have starved the timed arm by ~40%. Trust only full-run ms_a/ms_b receipts.
+    "timed": {"time_budget_s": 0.40},
 }
 
 _PRISTINE = {}
