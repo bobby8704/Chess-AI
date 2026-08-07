@@ -271,6 +271,8 @@ VARIANT_CONFIG = {
     # which is why the first 240-pair result (+45.1) cannot be read as reallocation
     # alone. Idle-box latency for the same arm is 241ms; calibrating from THAT would
     # have starved the timed arm by ~40%. Trust only full-run ms_a/ms_b receipts.
+    # MEASURED across both 240-pair runs: +45.1 (+12% time) and +16.7 (-3% time);
+    # time-corrected residuals +23.3 and +22.9 — reallocation is worth ~+10..+30.
     "timed": {"time_budget_s": 0.40},
 }
 

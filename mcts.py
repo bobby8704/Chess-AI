@@ -463,6 +463,14 @@ class MCTSConfig:
     # shifts toward positions whose simulations are cheap; whether that reallocation
     # helps, hurts, or does nothing is a bench/elo.py question, not an assumption.
     # Deliberately nondeterministic — sims per move vary with position and load.
+    #
+    # MEASURED 2026-08-07/08, two independent 240-pair runs vs current:100, int8 both
+    # arms (elo_timed1300_vs_current100_models.json and -2.json). Run 1 carried a +12%
+    # time surplus and scored +45.1 [+18.6,+72.2]; run 2 a -3% deficit and +16.7
+    # [-7.3,+40.8]. Time-correcting both at ~127 Elo/doubling leaves the SAME residual,
+    # +23.3 and +22.9 — the reallocation itself is worth roughly +10..+30 Elo at this
+    # scale and is at worst free. Verdict: prefer a time budget over fixed sims when
+    # serving; it also caps tail latency, which fixed sims never can.
     time_budget_s: float = 0.0
 
 
