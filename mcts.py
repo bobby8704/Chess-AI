@@ -447,6 +447,14 @@ class MCTSConfig:
     # Requires the SAME player instance across moves and a board that keeps its move
     # stack; anything else fails closed to a fresh tree. Off by default: flag-off is
     # bit-identical to the pre-flag engine.
+    #
+    # MEASURED 2026-08-07 (elo_reuse100_vs_current100_models.json): +6.5 Elo, 95% CI
+    # [-22.3, +35.4], 240 pairs at 100 sims, int8 on both arms — a null from a run
+    # powered to +/-41, so the effect is below ~+35 and probably single digits. The
+    # free-sims arithmetic over-promised because the inherited subtree is the line the
+    # fresh search re-finds fastest anyway: ~10-20% extra visits concentrated exactly
+    # where the priors already point. NOT adopted in serving; the flag stays for any
+    # future search where reuse fractions are larger (e.g. after a native kernel).
     tree_reuse: bool = False
 
 

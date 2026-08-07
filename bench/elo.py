@@ -251,6 +251,7 @@ VARIANT_CONFIG = {
     # across the whole game (workers build players once), and _play_game pushes moves
     # onto one board so the move stack survives. Same sims per move as the control —
     # the inherited visits are the free part, so latency is unchanged by design.
+    # MEASURED: +6.5 Elo, CI [-22.3, +35.4], 240 pairs @100 sims — null, not adopted.
     "reuse": {"tree_reuse": True},
 }
 
