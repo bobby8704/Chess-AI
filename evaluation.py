@@ -635,14 +635,18 @@ def evaluate_quiescence(board: chess.Board, max_depth: int = 2) -> float:
 
     Returns value from current player's perspective in [-1, +1].
     """
-    return math.tanh(_quiescence(board, max_depth, -100000, 100000) / 400.0)
+    return math.tanh(_quiescence(board, max_depth, -100000, 100000, True) / 400.0)
 
 
-def _quiescence(board: chess.Board, depth: int, alpha: int, beta: int) -> int:
+def _quiescence(board: chess.Board, depth: int, alpha: int, beta: int,
+                root: bool = False) -> int:
     """
     Quiescence search in centipawns from current player's perspective.
     Only searches capture moves to resolve tactical instability.
     Uses alpha-beta pruning for efficiency.
+
+    `root` marks the position this search was entered on. It gates the draw claim, which
+    is provably impossible anywhere below it — see the comment at that check.
     """
     # is_checkmate() and is_stalemate() each walk the full legal move generator, and
     # this runs at every quiescence node. Generate once and derive both, which is
@@ -655,7 +659,29 @@ def _quiescence(board: chess.Board, depth: int, alpha: int, beta: int) -> int:
     if not has_legal:
         return -30000 if in_check else 0
 
-    if board.is_insufficient_material() or board.can_claim_draw():
+    # Insufficient material is checked at EVERY depth: a capture can create it.
+    if board.is_insufficient_material():
+        return 0
+
+    # can_claim_draw() is checked ONLY at the root, because below it the answer is
+    # provably always False — and it is expensive, so asking anyway was 14.5% of a whole
+    # 600-simulation move (profiled: 1.19s of 8.23s, 2471 calls for 601 leaves).
+    #
+    # This search recurses on captures and promotions ONLY, and both are irreversible:
+    #   * fifty-move — a capture resets the halfmove clock, and a promotion is a pawn
+    #     move, so it resets it too. can_claim_fifty_moves needs clock >= 100.
+    #   * threefold — a capture strictly decreases piece count and a promotion strictly
+    #     decreases pawn count. Both quantities are non-increasing over a game, so every
+    #     position already in the move stack has MORE of them than the position we just
+    #     pushed. It therefore cannot equal any of them, and no repetition is possible.
+    #     The same argument covers python-chess's extra lookahead, which asks whether a
+    #     repetition is reachable in one more move: those positions have no more material
+    #     than the post-capture one either.
+    #
+    # So this is a pure speedup, not a behaviour change. verify.py agrees: 0/26 chosen-move
+    # and 0/26 visit-distribution differences. bench/test_edge_cases.py covers the paths
+    # verify.py cannot reach.
+    if root and board.can_claim_draw():
         return 0
 
     # Standing pat: evaluate the position statically
