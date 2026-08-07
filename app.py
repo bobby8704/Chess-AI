@@ -46,12 +46,22 @@ MODEL_PATH = "models/dual_model_mcts.pt"
 # to dominate playing strength, and each rung below is a measured Elo gap:
 #
 #     sims   latency (median/p90)   measured strength
-#      100    518 /  662 ms         baseline
-#      600   3203 / 4196 ms         +328 Elo over 100   (CI [+242,+468], 80 games)
-#     1300   7033 / 8681 ms         +220 Elo over 600   (CI [+128,+352], 50 games)
+#      100    248 /  283 ms         baseline
+#      600   1580 / 1947 ms         +328 Elo over 100   (CI [+242,+468], 80 games)
+#     1300   3450 / 4472 ms         +220 Elo over 600   (CI [+128,+352], 50 games)
 #
-# Latency is single-request on an idle box through this exact serving path (ONNX fp32,
+# Latency is single-request on an idle box through this exact serving path (ONNX int8,
 # CHESS_NUM_THREADS=4, fresh player per move).
+#
+# THE INT8 QUANTISATION ROUGHLY HALVED ALL THREE (2026-08-07). hard now costs what medium
+# used to — 3450ms against the old fp32 medium's 3203ms — which is why hard is the default
+# rather than a power-user option. Measured end to end, int8 at 1300 sims beats the
+# previous default (fp32 at 600) by +175.7 Elo, CI [+118,+244], LOS 100%, 120 games.
+# Quantisation itself is free: -13.0 Elo at equal simulations, CI [-60.1,+33.5]. The Elo
+# is bought with the SPEED, not with the quantisation.
+#
+# The Elo gaps above were measured on fp32 and are carried forward unchanged, since int8
+# is strength-neutral per simulation. Re-measure them if the served model changes again.
 #
 # THESE WERE BRIEFLY SET TO 100/300/600 AND THAT WAS A ~220 ELO REGRESSION. The cut was
 # justified by an ACPL measurement of +0.17 cp for 1300 over 600, with a 95% CI of
@@ -275,7 +285,12 @@ def make_move():
 
     # --- AI reply (fresh player per move to avoid memory bloat from stale trees) ---
     difficulty = game_difficulty.get(game_id, "hard")
-    num_sims = DIFFICULTY_PRESETS.get(difficulty, 300)
+    # Fall back to the SAME preset the rest of this file defaults to. This used to read
+    # `.get(difficulty, 300)` — 300 is not one of the presets, and is roughly 220+ Elo
+    # below hard, so any path that ever reached it would have quietly served a much weaker
+    # engine with nothing in the response to say so. Unreachable today (difficulty is
+    # validated in /api/new-game), which is exactly why it would have gone unnoticed.
+    num_sims = DIFFICULTY_PRESETS.get(difficulty, DIFFICULTY_PRESETS["hard"])
 
     # Boost sims in lone-king endgames to find checkmate faster
     opponent_pieces = sum(1 for sq in chess.SQUARES
