@@ -174,6 +174,11 @@ def _overrides_reuse():
     return {}
 
 
+def _overrides_timed():
+    """Wall-clock move budget instead of fixed sims; SIMS in the arm spec is the cap."""
+    return {}
+
+
 # A positive control for the value-head experiment, in the spirit of strength.py's
 # --uniform arm. vh-blend lost 137 Elo, and there are two candidate explanations that the
 # head-to-head cannot separate on its own:
@@ -214,6 +219,7 @@ VARIANTS = {
     "cpuct-0.6": _overrides_cpuct_06,
     "cpuct-2.1": _overrides_cpuct_21,
     "reuse": _overrides_reuse,
+    "timed": _overrides_timed,
 }
 
 # Per-arm MCTSConfig overrides, applied when the arm's player is constructed.
@@ -253,6 +259,12 @@ VARIANT_CONFIG = {
     # the inherited visits are the free part, so latency is unchanged by design.
     # MEASURED: +6.5 Elo, CI [-22.3, +35.4], 240 pairs @100 sims — null, not adopted.
     "reuse": {"tree_reuse": True},
+    # Wall-clock budget, tuned so the timed arm's MEASURED move time matches the fixed
+    # 100-sim arm's IN THIS HARNESS (6 workers x 2 threads, adjudicator load) — an
+    # idle-box calibration would hand the timed arm a silent sim deficit, because a
+    # timed arm is the one thing h2h's timing-independence does not cover. The ms_a /
+    # ms_b fields in every results row are the receipt that the match actually held.
+    "timed": {"time_budget_s": 0.25},
 }
 
 _PRISTINE = {}
@@ -483,6 +495,7 @@ def _play_game(task):
 
     history = []
     moves_played = []
+    eng_ms = {}
     result = None
     t0 = time.perf_counter()
     restarts0 = _ENGINE_RESTARTS
@@ -502,7 +515,9 @@ def _play_game(task):
                 board, chess.engine.Limit(time=_SF_MOVETIME)).move
         else:
             activate(_ARM_VARIANT[key], key)  # per-move: variant AND model are global
+            t_mv = time.perf_counter()
             move = _PLAYERS[key].select_move(board)
+            eng_ms.setdefault(key, []).append((time.perf_counter() - t_mv) * 1000.0)
         if move is None:
             result = "1/2-1/2"
             break
@@ -538,6 +553,12 @@ def _play_game(task):
         # played through a restarted adjudicator is still valid, but a run where this is
         # not near zero is a run whose environment is unhealthy.
         "adj_restarts": _ENGINE_RESTARTS - restarts0,
+        # Mean engine move time per arm, measured IN this environment. An equal-TIME
+        # comparison is only valid if the arms' move times actually match under the
+        # run's real contention — nothing recorded that before, so the playbook's
+        # "verify the medians match afterwards" rule could not actually be followed.
+        "ms_a": round(sum(eng_ms["a"]) / len(eng_ms["a"]), 1) if eng_ms.get("a") else None,
+        "ms_b": round(sum(eng_ms["b"]) / len(eng_ms["b"]), 1) if eng_ms.get("b") else None,
     }
 
 
@@ -681,6 +702,13 @@ def cmd_h2h(a_spec, b_spec, n_pairs, workers, threads, a_model=None, b_model=Non
     draws = sum(1 for g in games if g["result"] == "1/2-1/2")
     print(f"\n  by colour: White {white_wins}, Black {black_wins}, draws {draws}"
           f"   (a large imbalance here is an engine property, not an arm difference)")
+
+    ms_a = sorted(g["ms_a"] for g in games if g.get("ms_a") is not None)
+    ms_b = sorted(g["ms_b"] for g in games if g.get("ms_b") is not None)
+    if ms_a and ms_b:
+        med_a, med_b = ms_a[len(ms_a) // 2], ms_b[len(ms_b) // 2]
+        print(f"  engine move time, median of per-game means: A {med_a:.0f} ms, "
+              f"B {med_b:.0f} ms   (an equal-TIME claim needs these to match)")
 
     # a_model/b_model are recorded so the file can PROVE which weights each arm ran —
     # without them no artifact could distinguish an int8 arm from an fp32 one.

@@ -13,6 +13,7 @@ Key features:
 """
 
 import math
+import time
 import numpy as np
 import chess
 from typing import Dict, List, Optional, Tuple
@@ -456,6 +457,13 @@ class MCTSConfig:
     # where the priors already point. NOT adopted in serving; the flag stays for any
     # future search where reuse fractions are larger (e.g. after a native kernel).
     tree_reuse: bool = False
+    # Wall-clock move budget in seconds; 0 = off (fixed num_simulations, the shipped
+    # behaviour). When set, simulations run until the deadline, still capped by
+    # num_simulations, and never fewer than one. Latency becomes bounded, and compute
+    # shifts toward positions whose simulations are cheap; whether that reallocation
+    # helps, hurts, or does nothing is a bench/elo.py question, not an assumption.
+    # Deliberately nondeterministic — sims per move vary with position and load.
+    time_budget_s: float = 0.0
 
 
 class MCTSNode:
@@ -735,25 +743,19 @@ class MCTS:
             )
 
         # Run simulations (use fast evaluate for non-root nodes)
-        for _ in range(num_sims):
-            node = root
-            path = [node]
-
-            # Selection: traverse tree to leaf
-            while node.is_expanded and not node.is_terminal:
-                _, node = node.select_child(self.config.c_puct)
-                path.append(node)
-
-            # Evaluation
-            if node.is_terminal:
-                value = node.terminal_value
-            else:
-                # Expand and evaluate (fast path — no heuristics/blunder checks)
-                move_probs, value = self.evaluate_fn(node.board)
-                node.expand(move_probs)
-
-            # Backpropagation
-            node.backpropagate(value)
+        if self.config.time_budget_s > 0:
+            # Wall-clock budget: simulate until the deadline, num_sims as a hard
+            # cap, never fewer than one. The perf_counter call is ~70ns against a
+            # ~2.4ms simulation, so the check itself costs nothing measurable.
+            deadline = time.perf_counter() + self.config.time_budget_s
+            sims_run = 0
+            while sims_run < num_sims and (sims_run == 0
+                                           or time.perf_counter() < deadline):
+                self._run_simulation(root)
+                sims_run += 1
+        else:
+            for _ in range(num_sims):
+                self._run_simulation(root)
 
         # Calculate move probabilities from visit counts
         # Iterate the priors, not the children: with lazy expansion a move that was
@@ -783,6 +785,23 @@ class MCTS:
             self._last_played = None
 
         return best_move, move_probs
+
+    def _run_simulation(self, root: MCTSNode):
+        """One simulation: select down to a leaf, evaluate/expand it, backpropagate.
+
+        (The old inline loop also built a `path` list on every simulation that
+        nothing ever read — dropped in the extraction; verify.py gates the change.)
+        """
+        node = root
+        while node.is_expanded and not node.is_terminal:
+            _, node = node.select_child(self.config.c_puct)
+        if node.is_terminal:
+            value = node.terminal_value
+        else:
+            # Fast path — no heuristics/blunder checks below the root.
+            move_probs, value = self.evaluate_fn(node.board)
+            node.expand(move_probs)
+        node.backpropagate(value)
 
     def _promote_reused_root(self, board: chess.Board) -> Optional[MCTSNode]:
         """
