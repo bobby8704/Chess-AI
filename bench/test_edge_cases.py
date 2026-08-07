@@ -116,7 +116,12 @@ def main():
 
     # --- 5. ONNX and torch backends must agree on the chosen move
     print("\n5. ONNX vs torch backend agreement")
-    import neural_network as nn_mod
+    # The session cache lives in inference.py's module globals (it moved there from
+    # neural_network in bf208dd). Resetting neural_network's re-exported names does
+    # NOTHING — get_onnx_session() returns inference._ort_session before it ever reads
+    # CHESS_USE_ONNX, so for two days this test compared the cached int8 session with
+    # itself and always passed. Reset the cache where it actually lives.
+    import inference as inf_mod
     from bench.positions import build_suite, rebuild
 
     # Pin the fp32 export here. Serving PREFERS the int8 quantisation, but int8 is a
@@ -133,8 +138,8 @@ def main():
         moves = {}
         for use_onnx in ("1", "0"):
             os.environ["CHESS_USE_ONNX"] = use_onnx
-            nn_mod._ort_session = None
-            nn_mod._ort_resolved = False
+            inf_mod._ort_session = None
+            inf_mod._ort_resolved = False
             p = MCTSPlayer(model=model, config=MCTSConfig(
                 num_simulations=200, temperature=0, add_noise=False))
             moves[use_onnx] = p.select_move(rebuild(entry))
@@ -144,8 +149,8 @@ def main():
             print(f"      {entry['name']}: onnx={moves['1']} torch={moves['0']}")
     os.environ["CHESS_USE_ONNX"] = "1"
     os.environ.pop("CHESS_ONNX_MODEL", None)
-    nn_mod._ort_session = None
-    nn_mod._ort_resolved = False
+    inf_mod._ort_session = None
+    inf_mod._ort_resolved = False
     check("fp32 export and torch pick the same move", agree == len(suite),
           f"{agree}/{len(suite)} positions agree")
 

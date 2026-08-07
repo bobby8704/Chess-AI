@@ -29,8 +29,12 @@ data/training/*.pt
 data/training/*.npz
 data/datasets/
 
-# Benchmark results are regenerable and contain machine-specific timings.
-bench/results/
+# bench/results/ is deliberately TRACKED (since 2026-08-07). "Regenerable" was wrong:
+# a results file is hours of games, one was already destroyed by a filename collision,
+# and an untracked results dir means no commit's headline number can be verified from
+# a clone. Timings are machine-specific; game outcomes and Elo estimates are not.
+# Run logs are console transcripts; the JSON results beside them are what is tracked.
+bench/results/logs/
 
 # bench/suites/ is deliberately TRACKED. The strength comparison is only valid if both
 # arms run on the identical frozen position set, so the suite must be shared and stable

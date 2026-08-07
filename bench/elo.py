@@ -384,6 +384,16 @@ def _init_worker(arms, threads, sf_elo=None, sf_movetime=0.1, models=None):
                 if path not in by_path:
                     by_path[path] = OnnxPolicyValue(path, threads=threads)
                 _ARM_SESSION[key] = by_path[path]
+        # Every engine arm needs an explicit session entry, or activate() leaves the
+        # process-global session pointing at whatever the OTHER arm installed last —
+        # i.e. a one-sided --a-model silently played the a-model on both arms.
+        for key in arms:
+            if key != "sf" and key not in _ARM_SESSION:
+                if session is None:
+                    raise RuntimeError(
+                        f"arm '{key}' has no pinned model and no default ONNX session "
+                        "resolved; pin BOTH models explicitly (--a-model/--b-model)")
+                _ARM_SESSION[key] = session
 
     from mcts import MCTSPlayer, MCTSConfig
     for key, (variant, sims) in arms.items():
@@ -590,6 +600,23 @@ def _run(tasks, arms, workers, threads, label, sf_elo=None, sf_movetime=0.1,
     return out, time.perf_counter() - t0
 
 
+def _unique_result_path(name):
+    """
+    Never overwrite an existing results file.
+
+    The old scheme did, and it destroyed data: the v2-retrain run and the later int8
+    equal-sims run both resolved to elo_current100_vs_current100_models.json, so the
+    second silently replaced the first and the v2 game records now exist only in a
+    commit message. Games cost hours; a filename must never be able to delete them.
+    """
+    path = os.path.join(RESULTS_DIR, f"{name}.json")
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(RESULTS_DIR, f"{name}-{n}.json")
+        n += 1
+    return path
+
+
 def cmd_h2h(a_spec, b_spec, n_pairs, workers, threads, a_model=None, b_model=None):
     a, b = parse_arm(a_spec), parse_arm(b_spec)
     models = {"a": a_model, "b": b_model} if (a_model or b_model) else None
@@ -619,7 +646,12 @@ def cmd_h2h(a_spec, b_spec, n_pairs, workers, threads, a_model=None, b_model=Non
         by_op.setdefault(g["opening"], []).append(g["fp"])
     twins = sum(1 for v in by_op.values() if len(v) == 2 and v[0] == v[1])
     complete = sum(1 for v in by_op.values() if len(v) == 2)
-    if complete and twins == complete and a != b:
+    # Arms can differ by SPEC or by MODEL. The old `a != b` guard compared specs only,
+    # so the one run whose arms differ purely by model — e.g. int8 vs fp32 at equal
+    # sims, where the model-swap machinery is the only thing under test — was exactly
+    # the run this gate would not protect.
+    arms_differ = a != b or a_model != b_model
+    if complete and twins == complete and arms_differ:
         print(f"\n  *** ALL {complete} pairs played IDENTICAL games. The two arms are "
               f"behaving as one engine — this run measures nothing. ***")
     elif twins:
@@ -638,12 +670,16 @@ def cmd_h2h(a_spec, b_spec, n_pairs, workers, threads, a_model=None, b_model=Non
     print(f"\n  by colour: White {white_wins}, Black {black_wins}, draws {draws}"
           f"   (a large imbalance here is an engine property, not an arm difference)")
 
-    out = {"a": a_spec, "b": b_spec, "games": len(games), "wdl": [w, d, l],
+    # a_model/b_model are recorded so the file can PROVE which weights each arm ran —
+    # without them no artifact could distinguish an int8 arm from an fp32 one.
+    out = {"a": a_spec, "b": b_spec, "a_model": a_model, "b_model": b_model,
+           "games": len(games), "wdl": [w, d, l],
            "stats": st, "wall_s": round(dt, 1), "rows": games}
     os.makedirs(RESULTS_DIR, exist_ok=True)
     tag = "_models" if models else ""
     name = f"elo_{a[0]}{a[1]}_vs_{b[0]}{b[1]}{tag}"
-    with open(os.path.join(RESULTS_DIR, f"{name}.json"), "w") as f:
+    path = _unique_result_path(name)
+    with open(path, "w") as f:
         json.dump(out, f)
 
     print(f"\n  A scored  +{w} ={d} -{l}  of {len(games)} games "
@@ -656,7 +692,7 @@ def cmd_h2h(a_spec, b_spec, n_pairs, workers, threads, a_model=None, b_model=Non
         print(f"  likelihood A is stronger: {st['los']:.1%}")
         print(f"\n  This run could resolve about +/-{st['detectable_elo']:.0f} Elo. "
               f"A null here means 'not measured' below that.")
-    print(f"\n  wrote {os.path.join(RESULTS_DIR, name + '.json')}")
+    print(f"\n  wrote {path}")
     return out
 
 
@@ -696,7 +732,11 @@ def cmd_gauntlet(a_spec, elos, n_pairs, workers, threads, movetime):
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     name = f"gauntlet_{a[0]}{a[1]}"
-    with open(os.path.join(RESULTS_DIR, f"{name}.json"), "w") as f:
+    if movetime != 0.1:
+        # A non-standard movetime is a different instrument, not a repeat run.
+        name += f"_mt{int(movetime * 1000)}"
+    path = _unique_result_path(name)
+    with open(path, "w") as f:
         json.dump({"a": a_spec, "movetime": movetime, "rows": rows}, f)
 
     usable = [r for r in rows if r["implied_elo"] is not None]

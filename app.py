@@ -46,12 +46,13 @@ MODEL_PATH = "models/dual_model_mcts.pt"
 # to dominate playing strength, and each rung below is a measured Elo gap:
 #
 #     sims   latency (median/p90)   measured strength
-#      100    248 /  283 ms         baseline
-#      600   1580 / 1947 ms         +328 Elo over 100   (CI [+242,+468], 80 games)
-#     1300   3450 / 4472 ms         +220 Elo over 600   (CI [+128,+352], 50 games)
+#      100    241 /  301 ms         baseline
+#      600   1366 / 1650 ms         +328 Elo over 100   (CI [+242,+468], 80 games)
+#     1300   3365 / 4370 ms         +220 Elo over 600   (CI [+128,+352], 50 games)
 #
 # Latency is single-request on an idle box through this exact serving path (ONNX int8,
-# CHESS_NUM_THREADS=4, fresh player per move).
+# CHESS_NUM_THREADS=4, fresh player per move), measured by bench/latency.py over 48
+# suite positions and recorded in bench/results/latency_int8.json (2026-08-07).
 #
 # THE INT8 QUANTISATION ROUGHLY HALVED ALL THREE (2026-08-07). hard now costs what medium
 # used to — 3450ms against the old fp32 medium's 3203ms — which is why hard is the default
