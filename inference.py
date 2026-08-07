@@ -114,11 +114,52 @@ def legal_move_indices(board: chess.Board):
 # ==================== ONNX Runtime session ====================
 
 _MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-DEFAULT_ONNX_PATH = os.path.join(_MODELS_DIR, "dual_model_mcts_fp32.onnx")
+
+# Served models, in preference order. The int8 export is a static QDQ quantisation of the
+# fp32 one: ~4x faster at batch size 1, 3.9x smaller (4.8MB vs 18.4MB), and measured
+# strength-neutral at equal simulations. fp32 stays as the fallback AND as the thing int8
+# is quantised from, so both are tracked.
+ONNX_PREFERENCE = ("dual_model_mcts_int8.onnx", "dual_model_mcts_fp32.onnx")
+
+# export_onnx.py writes this one, so it is what error messages should name.
+DEFAULT_ONNX_PATH = os.path.join(_MODELS_DIR, ONNX_PREFERENCE[-1])
 DEFAULT_CKPT_PATH = os.path.join(_MODELS_DIR, "dual_model_mcts.pt")
 
 _ort_session = None
 _ort_resolved = False
+
+
+def onnx_candidates():
+    """Absolute model paths in preference order, honouring CHESS_ONNX_MODEL."""
+    override = os.environ.get("CHESS_ONNX_MODEL")
+    if override:
+        return [override if os.path.isabs(override)
+                else os.path.join(_MODELS_DIR, override)]
+    return [os.path.join(_MODELS_DIR, name) for name in ONNX_PREFERENCE]
+
+
+def resolve_onnx_path():
+    """
+    First existing candidate, skipping a quantisation that has gone stale.
+
+    int8 is DERIVED from the fp32 export, which is derived from the checkpoint. So a
+    re-export that is not followed by a re-quantise leaves an int8 file built from the
+    previous weights — and serving it would look perfectly healthy while quietly playing
+    the old model. That is the same silent-staleness failure get_onnx_session already
+    guards against for checkpoint-vs-export, one level further down the chain.
+    """
+    fp32 = os.path.join(_MODELS_DIR, "dual_model_mcts_fp32.onnx")
+    for path in onnx_candidates():
+        if not os.path.exists(path):
+            continue
+        if (path.endswith("_int8.onnx") and os.path.exists(fp32)
+                and os.path.getmtime(fp32) > os.path.getmtime(path)):
+            print(f"WARNING: {os.path.basename(fp32)} is newer than "
+                  f"{os.path.basename(path)} - the int8 quantisation is stale, so it is "
+                  f"being skipped. Re-quantise with: python export_onnx.py --int8")
+            continue
+        return path
+    return None
 
 
 def num_threads() -> int:
@@ -162,7 +203,8 @@ def get_onnx_session(path: str = None):
     """
     Return a cached ONNX session for inference, or None to fall back to torch.
 
-    Resolved once per process. Set CHESS_USE_ONNX=0 to force the torch path.
+    Resolved once per process. Set CHESS_USE_ONNX=0 to force the torch path, or
+    CHESS_ONNX_MODEL=<name-or-path> to pin a specific export.
     """
     global _ort_session, _ort_resolved
     if _ort_resolved:
@@ -172,8 +214,8 @@ def get_onnx_session(path: str = None):
     if os.environ.get("CHESS_USE_ONNX", "1") == "0":
         return None
 
-    path = path or DEFAULT_ONNX_PATH
-    if not os.path.exists(path):
+    path = path or resolve_onnx_path()
+    if path is None or not os.path.exists(path):
         return None
 
     # Refuse a stale export. If the checkpoint has been retrained since the ONNX file

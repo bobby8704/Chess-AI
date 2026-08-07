@@ -40,11 +40,14 @@ bench/results/
 # accumulate in history forever — an unadopted one already slipped in via `git add -A`.
 models/*.onnx
 !models/dual_model_mcts_fp32.onnx
+!models/dual_model_mcts_int8.onnx
 
-# NOTE: models/dual_model_mcts_fp32.onnx is deliberately TRACKED, not ignored. It is
-# the artifact the web server actually serves, and keeping it in the repo is what makes
-# a clone-based deploy work — see bench/test_deploy.py. Torch checkpoints (*.pt) stay
-# ignored: they are training artifacts, and the .onnx is regenerated from them by
+# NOTE: both of those are deliberately TRACKED, not ignored. They are what the web server
+# actually serves, and keeping them in the repo is what makes a clone-based deploy work —
+# see bench/test_deploy.py. int8 (4.8MB) is what inference.py prefers; fp32 (18.4MB) is
+# kept because it is BOTH the fallback and the model int8 is quantised from, so dropping
+# it would make the quantisation unreproducible from a clone. Torch checkpoints (*.pt)
+# stay ignored: they are training artifacts, and the .onnx is regenerated from them by
 # export_onnx.py.
 models/*.onnx.data
 
