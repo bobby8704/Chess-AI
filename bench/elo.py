@@ -169,6 +169,11 @@ def _overrides_cpuct_21():
     return {}
 
 
+def _overrides_reuse():
+    """Tree reuse between moves: inherit the played-line subtree, same sims per move."""
+    return {}
+
+
 # A positive control for the value-head experiment, in the spirit of strength.py's
 # --uniform arm. vh-blend lost 137 Elo, and there are two candidate explanations that the
 # head-to-head cannot separate on its own:
@@ -208,6 +213,7 @@ VARIANTS = {
     "cpuct-1.0": _overrides_cpuct_10,
     "cpuct-0.6": _overrides_cpuct_06,
     "cpuct-2.1": _overrides_cpuct_21,
+    "reuse": _overrides_reuse,
 }
 
 # Per-arm MCTSConfig overrides, applied when the arm's player is constructed.
@@ -241,6 +247,11 @@ VARIANT_CONFIG = {
     "cpuct-1.0": {"c_puct": 1.0},
     "cpuct-0.6": {"c_puct": 0.6},
     "cpuct-2.1": {"c_puct": 2.14},
+    # Tree reuse leans on two properties of THIS harness: each arm's player persists
+    # across the whole game (workers build players once), and _play_game pushes moves
+    # onto one board so the move stack survives. Same sims per move as the control —
+    # the inherited visits are the free part, so latency is unchanged by design.
+    "reuse": {"tree_reuse": True},
 }
 
 _PRISTINE = {}

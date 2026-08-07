@@ -441,6 +441,13 @@ class MCTSConfig:
     # Share of the leaf value taken from the network's value head; see leaf_value().
     # 0.0 = quiescence only, which is what shipped before this knob existed.
     value_head_weight: float = 0.0
+    # Carry the search tree between consecutive moves of one game: after our move and
+    # the opponent's reply, the matching grandchild subtree becomes the next root, so
+    # its visits and values are inherited for free before the new simulations start.
+    # Requires the SAME player instance across moves and a board that keeps its move
+    # stack; anything else fails closed to a fresh tree. Off by default: flag-off is
+    # bit-identical to the pre-flag engine.
+    tree_reuse: bool = False
 
 
 class MCTSNode:
@@ -651,6 +658,14 @@ class MCTS:
         self.evaluate_fn = evaluate_fn or self._default_evaluate
         self.root_evaluate_fn = root_evaluate_fn
 
+        # Tree-reuse state (config.tree_reuse). _last_root/_last_fen are written by
+        # search(); _last_played is written by note_played() AFTER the post-search
+        # vetoes, because the move the search chose is not always the move played.
+        self._last_root = None
+        self._last_fen = None
+        self._last_played = None
+        self.reuse_hits = 0
+
     def _default_evaluate(
         self,
         board: chess.Board
@@ -683,13 +698,26 @@ class MCTS:
 
         num_sims = num_simulations or self.config.num_simulations
 
-        # Create root node
-        root = MCTSNode(board)
+        # Reuse the subtree from the previous search when this position is exactly
+        # (previous position + our played move + the opponent's reply); otherwise a
+        # fresh root, which is also the only path when the flag is off.
+        root = self._promote_reused_root(board) if self.config.tree_reuse else None
+        if root is None:
+            root = MCTSNode(board)
 
-        # Expand root (use full evaluate with heuristics)
         root_eval_fn = self.root_evaluate_fn or self.evaluate_fn
         move_probs, _ = root_eval_fn(board)
-        root.expand(move_probs)
+        if root.is_expanded:
+            # Promoted subtree root. It was expanded with the FAST priors (no
+            # heuristic boosts, no blunder scan, no mate dominance — those are
+            # root-only by design), so replace its priors with the root pipeline's
+            # while keeping the inherited visit statistics. Existing children are
+            # kept in sync exactly as add_dirichlet_noise does.
+            root.child_priors = dict(move_probs)
+            for mv, child in root.children.items():
+                child.prior = root.child_priors.get(mv, 0.0)
+        else:
+            root.expand(move_probs)
 
         # Add exploration noise at root during training
         if self.config.add_noise:
@@ -737,7 +765,63 @@ class MCTS:
         # Select move based on temperature
         best_move = self._select_move(root, move_probs)
 
+        if self.config.tree_reuse:
+            # Keep the tree for the next call. _last_played stays None until
+            # note_played(): the vetoes in MCTSPlayer.select_move can override
+            # best_move, and reusing the subtree of a move that was NOT played
+            # would search the wrong position's tree.
+            self._last_root = root
+            self._last_fen = board.fen()
+            self._last_played = None
+
         return best_move, move_probs
+
+    def _promote_reused_root(self, board: chess.Board) -> Optional[MCTSNode]:
+        """
+        Return the previous search's grandchild subtree for `board`, or None.
+
+        Matches only when board is exactly (last searched position + the move
+        note_played() recorded + one opponent reply), verified by move stack AND by
+        FEN — a same-looking stack after a new game or an undo fails the FEN check
+        and falls back to a fresh tree. Every failure mode here is fail-closed.
+        """
+        last_root, last_fen = self._last_root, self._last_fen
+        played = self._last_played
+        if last_root is None or played is None or len(board.move_stack) < 2:
+            return None
+        if board.move_stack[-2] != played:
+            return None
+        prev = board.copy()
+        reply = prev.pop()
+        prev.pop()
+        if prev.fen() != last_fen:
+            return None
+        child = last_root.children.get(played)
+        node = child.children.get(reply) if child is not None else None
+        if node is None or node.is_terminal or not node.is_expanded:
+            return None
+        # Detach: backpropagation walks node.parent and must stop at the new root —
+        # attached, every new simulation would also pollute the dead old tree's
+        # statistics from the wrong perspective. Dropping the reference also lets
+        # everything except this subtree be garbage-collected.
+        node.parent = None
+        node.move = None
+        node.prior = 0.0
+        # Tree boards carry a TREE_STACK_DEPTH-truncated move stack. As root this
+        # node must see the REAL board — full history, exactly like a fresh root —
+        # or root-level repetition behaviour would differ from the fresh-tree path.
+        node.board = board.copy()
+        self.reuse_hits += 1
+        return node
+
+    def note_played(self, move: Optional[chess.Move]):
+        """Record the move actually PLAYED (post-veto) for the next search's reuse."""
+        if self._last_root is not None:
+            self._last_played = move
+
+    def invalidate_reuse(self):
+        """Drop any carried tree — the next search starts fresh."""
+        self._last_root = self._last_fen = self._last_played = None
 
     def _select_move(
         self,
@@ -1423,6 +1507,8 @@ class MCTSPlayer:
         if tablebase.should_probe(board):
             tb_move = tablebase.probe(board)
             if tb_move is not None:
+                # No search ran, so any carried tree is now one move stale.
+                self.mcts.invalidate_reuse()
                 if return_policy:
                     return tb_move, {tb_move: 1.0}
                 return tb_move
@@ -1430,6 +1516,7 @@ class MCTSPlayer:
         # Fallback: lone king eval-based search (when tablebase unavailable)
         lone_king_move = _select_lone_king_mate_move(board)
         if lone_king_move is not None:
+            self.mcts.invalidate_reuse()
             if return_policy:
                 return lone_king_move, {lone_king_move: 1.0}
             return lone_king_move
@@ -1488,6 +1575,10 @@ class MCTSPlayer:
                             and not _has_mate_in_1(alt_board)):
                         move = alt_move
                         break
+
+        # Post-veto, so the recorded move is the one that will actually appear on
+        # the board — tree reuse keys its continuation check on it.
+        self.mcts.note_played(move)
 
         if return_policy:
             return move, move_probs
