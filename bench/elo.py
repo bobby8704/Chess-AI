@@ -154,6 +154,21 @@ def _overrides_vh_only():
     return {}
 
 
+def _overrides_cpuct_10():
+    """c_puct 1.0 instead of the shipped 1.5 (less exploration)."""
+    return {}
+
+
+def _overrides_cpuct_06():
+    """c_puct 0.6 instead of the shipped 1.5 (much less exploration)."""
+    return {}
+
+
+def _overrides_cpuct_21():
+    """c_puct 2.14: the value-scale control's algebraic equivalent, as a cross-check."""
+    return {}
+
+
 # A positive control for the value-head experiment, in the spirit of strength.py's
 # --uniform arm. vh-blend lost 137 Elo, and there are two candidate explanations that the
 # head-to-head cannot separate on its own:
@@ -190,6 +205,9 @@ VARIANTS = {
     "vh-blend30": _overrides_vh_blend30,
     "vh-blend70": _overrides_vh_blend70,
     "vh-only": _overrides_vh_only,
+    "cpuct-1.0": _overrides_cpuct_10,
+    "cpuct-0.6": _overrides_cpuct_06,
+    "cpuct-2.1": _overrides_cpuct_21,
 }
 
 # Per-arm MCTSConfig overrides, applied when the arm's player is constructed.
@@ -209,6 +227,20 @@ VARIANT_CONFIG = {
     "vh-blend30": {"value_head_weight": 0.3},
     "vh-blend70": {"value_head_weight": 0.7},
     "vh-only": {"value_head_weight": 1.0},
+    # c_puct. The shipped value is 1.5 and it has never been chosen by a game measurement:
+    # the only sweep was ACPL at n=400, all nulls, which on this project is worth about
+    # +/-150 Elo and has twice pointed the wrong way.
+    #
+    # What motivates testing BELOW 1.5: the quiesc-scaled control lost 73.5 Elo, and
+    # scaling every leaf value by k is equivalent to scaling c_puct by 1/k, so that run
+    # was approximately c_puct 2.14. That establishes the parameter is STEEP near 1.5 and
+    # that 2.14 is worse. It does NOT by itself establish that lower is better — if 1.5
+    # were already optimal, both directions would lose. Hence a bracket rather than a
+    # single step, and hence cpuct-2.1, which should reproduce the control's ~-73.5 Elo
+    # if the value-scale/c_puct equivalence is real.
+    "cpuct-1.0": {"c_puct": 1.0},
+    "cpuct-0.6": {"c_puct": 0.6},
+    "cpuct-2.1": {"c_puct": 2.14},
 }
 
 _PRISTINE = {}
