@@ -40,40 +40,48 @@ app = Flask(__name__)
 # Load the trained model once at startup
 MODEL_PATH = "models/dual_model_mcts.pt"
 
-# Difficulty presets: name -> simulations.
+# Difficulty presets: name -> (wall-clock budget in seconds, simulation cap).
 #
-# Set from HEAD-TO-HEAD GAMES (bench/elo.py), not from ACPL. Simulation count turns out
-# to dominate playing strength, and each rung below is a measured Elo gap:
+# TIME-BUDGETED as of 2026-08-08, replacing fixed simulation counts. Two measured
+# reasons (bench/results/elo_timed1300_vs_current100_models.json and -2.json, two
+# independent 480-game runs):
+#   - At equal average move time, searching until a deadline beats a fixed sim count
+#     by roughly +10..+30 Elo: the two runs carried OPPOSITE time confounds (+12% and
+#     -3%) and their time-corrected residuals agree at +23.3 and +22.9. The budget
+#     spends simulations where they are cheap instead of the same number everywhere.
+#   - A budget caps tail latency, which fixed sims structurally cannot: hard's p90 was
+#     4370ms against a 3365ms median (bench/results/latency_int8.json).
 #
-#     sims   latency (median/p90)   measured strength
-#      100    241 /  301 ms         baseline
-#      600   1366 / 1650 ms         +328 Elo over 100   (CI [+242,+468], 80 games)
-#     1300   3365 / 4370 ms         +220 Elo over 600   (CI [+128,+352], 50 games)
+# Each budget equals its old preset's MEASURED median latency (latency_int8.json:
+# 241/1366/3365 ms, idle box, 4 threads, int8), so a preset costs what it always did,
+# now spends the old tail headroom on search, and stops being position-dependent. The
+# reply's time_ms runs ~50-100ms over the budget: the root heuristic pipeline, the
+# post-search vetoes, and the final simulation are outside the deadline check.
+# The sims cap bounds memory and runaway cheap-sim positions (~6-8x the typical count).
 #
-# Latency is single-request on an idle box through this exact serving path (ONNX int8,
-# CHESS_NUM_THREADS=4, fresh player per move), measured by bench/latency.py over 48
-# suite positions and recorded in bench/results/latency_int8.json (2026-08-07).
+# The strength ladder was measured on the fixed-sims presets and carries over:
+# easy->medium +328 Elo (CI [+242,+468], 80 games, fp32); medium->hard +172.0 measured
+# DIRECTLY on int8 (CI [+110,+246], 120 games, elo_current1300_vs_current600_models-2).
+# Absolute anchor for hard: ~1229 Elo vs Stockfish at 100ms/move, a soft upper bound
+# (gauntlet_current1300.json).
 #
-# THE INT8 QUANTISATION ROUGHLY HALVED ALL THREE (2026-08-07). hard now costs what medium
-# used to — 3450ms against the old fp32 medium's 3203ms — which is why hard is the default
-# rather than a power-user option. Measured end to end, int8 at 1300 sims beats the
-# previous default (fp32 at 600) by +175.7 Elo, CI [+118,+244], LOS 100%, 120 games.
-# Quantisation itself is free: -13.0 Elo at equal simulations, CI [-60.1,+33.5]. The Elo
-# is bought with the SPEED, not with the quantisation.
+# THE PRESETS WERE BRIEFLY CUT TO 100/300/600 SIMS AND THAT WAS A ~220 ELO REGRESSION,
+# justified by an ACPL null whose CI spanned +/-150 Elo. Do not size a strength decision
+# with ACPL — use bench/elo.py. (The full incident is in bench/README.md.)
 #
-# The Elo gaps above were measured on fp32 and are carried forward unchanged, since int8
-# is strength-neutral per simulation. Re-measure them if the served model changes again.
-#
-# THESE WERE BRIEFLY SET TO 100/300/600 AND THAT WAS A ~220 ELO REGRESSION. The cut was
-# justified by an ACPL measurement of +0.17 cp for 1300 over 600, with a 95% CI of
-# [-8.31, +8.66] cp, read as "no difference". It was not: ~10 cp of ACPL is worth
-# roughly 200 Elo, so that interval spanned about +/-150 Elo and contained nothing but
-# ignorance. ACPL scores one move from a static position; in a real game the small
-# per-move edges compound. Do not size a strength decision with it — use bench/elo.py.
-#
-# Safety is unaffected across the range: mate-in-1 300/300 at 50, 100, 300 and 600 sims;
-# walk-into-mate 0/200 at both 50 and 600.
+# CHESS_FIXED_SIMS=1 restores the fixed-sims presets below. A timed search is
+# deliberately nondeterministic (sims vary with position and load), and
+# bench/test_deploy.py asserts identical moves across processes — only determinism
+# can promise that.
 DIFFICULTY_PRESETS = {
+    "easy": (0.25, 1000),
+    "medium": (1.40, 5000),
+    "hard": (3.40, 10000),
+}
+
+# The pre-2026-08-08 fixed-sims presets, kept for CHESS_FIXED_SIMS=1 (deterministic
+# test mode) and as the record of what the budgets were calibrated against.
+FIXED_SIMS_PRESETS = {
     "easy": 100,
     "medium": 600,
     "hard": 1300,
@@ -106,13 +114,27 @@ elif dual_model is None:
     )
 
 
-def _make_player(num_sims: int) -> MCTSPlayer:
-    """Create a fresh MCTS player (new search tree each time to avoid memory bloat)."""
-    config = MCTSConfig(
-        num_simulations=num_sims,
-        temperature=0,
-        add_noise=False,
-    )
+def _make_player(difficulty: str, lone_king: bool = False) -> MCTSPlayer:
+    """Create a fresh MCTS player for one move (new search tree each time).
+
+    Unknown difficulty falls back to the DEFAULT preset, never to a weaker
+    hidden one — a .get(..., 300) here once made any unvalidated path serve a
+    ~220-Elo-weaker engine with nothing in the response to say so.
+    """
+    if os.environ.get("CHESS_FIXED_SIMS") == "1":
+        sims = FIXED_SIMS_PRESETS.get(difficulty, FIXED_SIMS_PRESETS["hard"])
+        if lone_king:
+            sims = max(sims, 800)
+        config = MCTSConfig(num_simulations=sims, temperature=0, add_noise=False)
+    else:
+        budget_s, sims_cap = DIFFICULTY_PRESETS.get(
+            difficulty, DIFFICULTY_PRESETS["hard"])
+        if lone_king:
+            # Same intent as the old >=800-sims boost (~2s at easy's rate): give a
+            # bare-king endgame enough search to actually find the mate.
+            budget_s = max(budget_s, 2.0)
+        config = MCTSConfig(num_simulations=sims_cap, time_budget_s=budget_s,
+                            temperature=0, add_noise=False)
     return MCTSPlayer(model=dual_model, config=config)
 
 # ---------------------------------------------------------------------------
@@ -286,21 +308,12 @@ def make_move():
 
     # --- AI reply (fresh player per move to avoid memory bloat from stale trees) ---
     difficulty = game_difficulty.get(game_id, "hard")
-    # Fall back to the SAME preset the rest of this file defaults to. This used to read
-    # `.get(difficulty, 300)` — 300 is not one of the presets, and is roughly 220+ Elo
-    # below hard, so any path that ever reached it would have quietly served a much weaker
-    # engine with nothing in the response to say so. Unreachable today (difficulty is
-    # validated in /api/new-game), which is exactly why it would have gone unnoticed.
-    num_sims = DIFFICULTY_PRESETS.get(difficulty, DIFFICULTY_PRESETS["hard"])
 
-    # Boost sims in lone-king endgames to find checkmate faster
+    # Lone-king endgames get a boosted budget so the mate actually gets found.
     opponent_pieces = sum(1 for sq in chess.SQUARES
                          if board.piece_at(sq) and board.piece_at(sq).color == chess.WHITE
                          and board.piece_at(sq).piece_type != chess.KING)
-    if opponent_pieces == 0:
-        num_sims = max(num_sims, 800)  # Lone king: search deeper for mate
-
-    player = _make_player(num_sims)
+    player = _make_player(difficulty, lone_king=(opponent_pieces == 0))
 
     start = time.time()
     ai_move = player.select_move(board)

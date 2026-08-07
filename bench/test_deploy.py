@@ -64,6 +64,9 @@ print("RESULT",
 def run(cwd, env_extra=None, prelude=""):
     env = dict(os.environ)
     env.pop("CHESS_USE_ONNX", None)
+    # The same-move assertions across cases A/B/D need a deterministic engine, and a
+    # time-budgeted search is deliberately not one — sims per move vary with load.
+    env["CHESS_FIXED_SIMS"] = "1"
     if env_extra:
         env.update(env_extra)
     r = subprocess.run([PY, "-c", prelude + PROBE], cwd=cwd, env=env,
