@@ -72,3 +72,8 @@ data/training/*.txt
 # OS
 .DS_Store
 Thumbs.db
+
+# Native kernel build artifacts (rebuild: python native/setup_native.py build_ext --inplace)
+native/build/
+native/*.pyd
+native/*.so
