@@ -185,6 +185,17 @@ def _overrides_timed_py():
     return {("evaluation", "evaluate_quiescence"): evaluation._evaluate_quiescence_py}
 
 
+def _overrides_timedh():
+    """The serving hard preset: 3.4s wall-clock budget, native quiescence."""
+    return {}
+
+
+def _overrides_timedh_py():
+    """Equal-time control at the SERVING scale: 3.4s budget, Python quiescence."""
+    import evaluation
+    return {("evaluation", "evaluate_quiescence"): evaluation._evaluate_quiescence_py}
+
+
 # A positive control for the value-head experiment, in the spirit of strength.py's
 # --uniform arm. vh-blend lost 137 Elo, and there are two candidate explanations that the
 # head-to-head cannot separate on its own:
@@ -227,6 +238,8 @@ VARIANTS = {
     "reuse": _overrides_reuse,
     "timed": _overrides_timed,
     "timed-py": _overrides_timed_py,
+    "timedh": _overrides_timedh,
+    "timedh-py": _overrides_timedh_py,
 }
 
 # Per-arm MCTSConfig overrides, applied when the arm's player is constructed.
@@ -285,7 +298,14 @@ VARIANT_CONFIG = {
     # default) vs timed-py (Python quiescence forced per move) at the SAME
     # budget. Equal wall clock by construction; the native arm simply runs more
     # simulations inside it, which is where the speedup's Elo should appear.
+    # MEASURED at this 0.40s scale: +32.7, CI [+4.3, +61.5], arms 440 vs 442ms
+    # — real but small, replicating the flat low-sims curve the 150v100 run
+    # hinted at (~26-35 Elo/doubling down here vs 154-172 at 600+ sims).
     "timed-py": {"time_budget_s": 0.40},
+    # The same gate at the scale that SHIPS (hard preset budget). The native
+    # arm's ~2x sims here spans 1300->2600, a rung measured directly at +172.
+    "timedh": {"time_budget_s": 3.4},
+    "timedh-py": {"time_budget_s": 3.4},
 }
 
 _PRISTINE = {}
