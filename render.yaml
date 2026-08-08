@@ -20,7 +20,20 @@ services:
     name: chess-ai
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements-serve.txt && python bench/test_deploy.py
+    # The native kernel is compiled DURING the build (Render build machines have
+    # gcc) and verified by the differential test on the committed suite before
+    # the deploy is allowed to finish. Deliberately NOT best-effort: the kernel
+    # is worth a measured +104 Elo at the hard preset
+    # (bench/results/elo_timedh20000_vs_timedh-py20000_models.json), and a
+    # silent fallback to the Python path would serve a weaker engine with
+    # nothing anywhere saying so. If this build step fails, the deploy fails
+    # loudly and the previous deploy keeps serving. At runtime the boot log
+    # prints "Native quiescence kernel enabled (chesskernel)" as the receipt.
+    buildCommand: >-
+      pip install -r requirements-serve.txt pybind11==3.1.0 setuptools &&
+      cd native && python setup_native.py build_ext --inplace && cd .. &&
+      python native/test_native.py --quick &&
+      python bench/test_deploy.py
     startCommand: python serve.py
     healthCheckPath: /
     envVars:
