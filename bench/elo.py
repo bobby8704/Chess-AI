@@ -179,6 +179,12 @@ def _overrides_timed():
     return {}
 
 
+def _overrides_timed_py():
+    """Equal-time control for the native kernel: same budget, PYTHON quiescence."""
+    import evaluation
+    return {("evaluation", "evaluate_quiescence"): evaluation._evaluate_quiescence_py}
+
+
 # A positive control for the value-head experiment, in the spirit of strength.py's
 # --uniform arm. vh-blend lost 137 Elo, and there are two candidate explanations that the
 # head-to-head cannot separate on its own:
@@ -220,6 +226,7 @@ VARIANTS = {
     "cpuct-2.1": _overrides_cpuct_21,
     "reuse": _overrides_reuse,
     "timed": _overrides_timed,
+    "timed-py": _overrides_timed_py,
 }
 
 # Per-arm MCTSConfig overrides, applied when the arm's player is constructed.
@@ -274,6 +281,11 @@ VARIANT_CONFIG = {
     # MEASURED across both 240-pair runs: +45.1 (+12% time) and +16.7 (-3% time);
     # time-corrected residuals +23.3 and +22.9 — reallocation is worth ~+10..+30.
     "timed": {"time_budget_s": 0.40},
+    # The native-kernel adoption gate: timed (native quiescence, the import-time
+    # default) vs timed-py (Python quiescence forced per move) at the SAME
+    # budget. Equal wall clock by construction; the native arm simply runs more
+    # simulations inside it, which is where the speedup's Elo should appear.
+    "timed-py": {"time_budget_s": 0.40},
 }
 
 _PRISTINE = {}

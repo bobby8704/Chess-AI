@@ -22,6 +22,8 @@ Components:
 
 import chess
 import math
+import os
+import sys
 
 # ============================================================
 # Piece values (centipawns)
@@ -625,9 +627,9 @@ def _back_rank_safety(board: chess.Board, color: bool) -> int:
 # Quiescence search
 # ============================================================
 
-def evaluate_quiescence(board: chess.Board, max_depth: int = 2) -> float:
+def _evaluate_quiescence_py(board: chess.Board, max_depth: int = 2) -> float:
     """
-    Evaluate a position with quiescence search.
+    Evaluate a position with quiescence search — the pure-Python reference.
 
     Extends the evaluation by playing out captures until the position
     is "quiet" (no more profitable captures). Max depth 3 plies to
@@ -636,6 +638,48 @@ def evaluate_quiescence(board: chess.Board, max_depth: int = 2) -> float:
     Returns value from current player's perspective in [-1, +1].
     """
     return math.tanh(_quiescence(board, max_depth, -100000, 100000, True) / 400.0)
+
+
+# ---------------------------------------------------------------------------
+# Native kernel dispatch. chesskernel (native/) implements the same search
+# 86x faster and INTEGER-EXACTLY: proven equal on 10,336 differential
+# positions (native/test_native.py), and the tanh stays here in Python so the
+# value path is bit-identical by construction. The import is OPTIONAL — a
+# deploy with no compiler and no wheel (Render today) falls back to the
+# Python path silently, and CHESS_NATIVE=0 forces the fallback for A/B runs
+# and debugging. The root draw-claim probe deliberately stays in Python (v1;
+# see native/PORT.md).
+# ---------------------------------------------------------------------------
+
+_native_kernel = None
+if os.environ.get("CHESS_NATIVE", "1") != "0":
+    _NATIVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native")
+    if _NATIVE_DIR not in sys.path:
+        sys.path.append(_NATIVE_DIR)
+    try:
+        import chesskernel as _native_kernel
+    except ImportError:
+        _native_kernel = None
+
+
+def _evaluate_quiescence_native(board: chess.Board, max_depth: int = 2) -> float:
+    """evaluate_quiescence via the native kernel. Same contract, same values."""
+    claimable = board.can_claim_draw()
+    cp = _native_kernel.qsearch(
+        board.pawns, board.knights, board.bishops, board.rooks,
+        board.queens, board.kings,
+        board.occupied_co[chess.WHITE], board.occupied_co[chess.BLACK],
+        0 if board.turn == chess.WHITE else 1,
+        board.ep_square if board.ep_square is not None else -1,
+        board.castling_rights, board.fullmove_number, max_depth, claimable)
+    return math.tanh(cp / 400.0)
+
+
+if _native_kernel is not None:
+    evaluate_quiescence = _evaluate_quiescence_native
+    print("Native quiescence kernel enabled (chesskernel)")
+else:
+    evaluate_quiescence = _evaluate_quiescence_py
 
 
 def _quiescence(board: chess.Board, depth: int, alpha: int, beta: int,
