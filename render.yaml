@@ -1,0 +1,36 @@
+# Render Blueprint — deploy from the dashboard with: New + -> Blueprint -> this repo.
+#
+# The build runs bench/test_deploy.py, so a deploy that could come up healthy while
+# serving random moves (or that breaks on Linux — every measurement so far was on
+# Windows) fails at BUILD time with readable logs, not silently in production.
+#
+# Sizing honesty: the strength numbers in bench/results/ were measured on a fast dev
+# box. The presets are wall-clock budgets (app.py), so on a small instance latency
+# stays capped at ~3.4s but the engine runs FEWER simulations inside that budget and
+# plays below its measured ~1229 Elo. The free plan (0.1 CPU) will be noticeably
+# weaker and spins down after ~15 idle minutes (first request then takes ~a minute).
+# A paid instance with a dedicated CPU narrows the gap. Measure before advertising a
+# strength number.
+#
+# Session state is in-process (see serve.py): exactly ONE instance. Do not scale
+# horizontally without moving sessions out of memory first.
+
+services:
+  - type: web
+    name: chess-ai
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements-serve.txt && python bench/test_deploy.py
+    startCommand: python serve.py
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        # Exactly the interpreter the engine is developed and measured against.
+        value: 3.12.10
+      - key: CHESS_MAX_CONCURRENT_AI
+        # One search at a time on a small instance: two would halve each other
+        # inside the GIL and both budgets would buy half the simulations.
+        value: "1"
+      - key: CHESS_ADMIN_TOKEN
+        # Render generates a secret; send it as X-Admin-Token to read /api/games.
+        generateValue: true
