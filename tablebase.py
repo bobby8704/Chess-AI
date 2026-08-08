@@ -12,8 +12,10 @@ Falls back gracefully when offline or API unavailable.
 
 import chess
 import json
-import urllib.request
+import os
 import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Optional, Tuple
 
 # Maximum pieces for tablebase lookup
@@ -21,6 +23,14 @@ MAX_TABLEBASE_PIECES = 7
 
 # API endpoint
 _API_URL = "https://tablebase.lichess.ovh/standard"
+
+# This probe is a synchronous third-party HTTPS call ON THE MOVE PATH: offline or
+# rate-limited, every new ≤7-piece position used to stall the reply by up to 3s
+# with no way to turn it off (bench/elo.py monkeypatches should_probe instead).
+# CHESS_TABLEBASE=0 disables it outright; the timeout default drops to 1s — a
+# tablebase answer is a bonus, not something worth multi-second stalls.
+_DISABLED = os.environ.get("CHESS_TABLEBASE", "1") == "0"
+_TIMEOUT_S = float(os.environ.get("CHESS_TABLEBASE_TIMEOUT", "1.0"))
 
 # Simple cache to avoid repeated API calls for the same position
 _cache: dict[str, Optional[dict]] = {}
@@ -34,7 +44,7 @@ def piece_count(board: chess.Board) -> int:
 
 def should_probe(board: chess.Board) -> bool:
     """Check if this position is eligible for tablebase lookup."""
-    if board.is_game_over():
+    if _DISABLED or board.is_game_over():
         return False
     return piece_count(board) <= MAX_TABLEBASE_PIECES
 
@@ -68,7 +78,7 @@ def probe(board: chess.Board) -> Optional[chess.Move]:
         encoded_fen = urllib.parse.quote(fen)
         url = f"{_API_URL}?fen={encoded_fen}"
         req = urllib.request.Request(url, headers={"User-Agent": "ChessAI/1.0"})
-        resp = urllib.request.urlopen(req, timeout=3)
+        resp = urllib.request.urlopen(req, timeout=_TIMEOUT_S)
         data = json.loads(resp.read().decode())
 
         # Cache the result
@@ -106,7 +116,7 @@ def probe_with_info(board: chess.Board) -> Tuple[Optional[chess.Move], Optional[
         encoded_fen = urllib.parse.quote(fen)
         url = f"{_API_URL}?fen={encoded_fen}"
         req = urllib.request.Request(url, headers={"User-Agent": "ChessAI/1.0"})
-        resp = urllib.request.urlopen(req, timeout=3)
+        resp = urllib.request.urlopen(req, timeout=_TIMEOUT_S)
         data = json.loads(resp.read().decode())
 
         if len(_cache) >= _MAX_CACHE:

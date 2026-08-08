@@ -6,8 +6,11 @@ Uses the MCTS engine with the trained dual neural network.
 """
 
 import os
+import threading
 import uuid
 import time
+from collections import deque
+
 import chess
 from flask import Flask, jsonify, request, render_template, send_from_directory
 
@@ -139,12 +142,85 @@ def _make_player(difficulty: str, lone_king: bool = False) -> MCTSPlayer:
 
 # ---------------------------------------------------------------------------
 # In-memory game sessions
+#
+# One process only (see serve.py) — these dicts ARE the session store, so a second
+# worker process would see none of the first's games. Everything here is mutated
+# from waitress worker threads, hence the locks: _sessions_lock guards the dicts
+# themselves, one Lock per game serialises moves within that game.
 # ---------------------------------------------------------------------------
 
 games: dict[str, chess.Board] = {}
 game_histories: dict[str, list[dict]] = {}
 game_difficulty: dict[str, str] = {}
-completed_games: list[dict] = []  # Archive of finished games
+game_last_active: dict[str, float] = {}
+_game_locks: dict[str, threading.Lock] = {}
+_sessions_lock = threading.Lock()
+
+# Finished-game archive. A deque with a hard cap, because nothing here is ever
+# allowed to grow with uptime: the old list grew forever AND was scanned linearly
+# per archive call (O(N^2) across a process lifetime).
+COMPLETED_GAMES_CAP = 500
+completed_games: deque = deque()
+_archived_ids: set[str] = set()
+
+# Live-session bounds. Stale games are archived and dropped; the cap evicts
+# oldest-idle first. Public web traffic is the sizing case, not the dev box.
+MAX_LIVE_GAMES = int(os.environ.get("CHESS_MAX_LIVE_GAMES", "200"))
+GAME_TTL_S = float(os.environ.get("CHESS_GAME_TTL_S", str(4 * 3600)))
+
+# Per-IP rate limit (sliding minute window). X-Forwarded-For is only meaningful
+# behind a trusted proxy, which is exactly where a public deploy runs; a spoofed
+# XFF on a direct connection only rate-limits the spoofer's chosen bucket.
+RATE_LIMIT_PER_MIN = int(os.environ.get("CHESS_RATE_LIMIT_PER_MIN", "30"))
+_rate_buckets: dict[str, deque] = {}
+_rate_lock = threading.Lock()
+
+# Concurrent AI searches. Each hard move is ~3.4s of nearly pure-Python CPU under
+# the GIL, so unbounded concurrency is a free DoS: the semaphore bounds the CPU
+# debt and turns overload into a fast 503 instead of a pile-up.
+_AI_SLOTS = threading.BoundedSemaphore(int(os.environ.get("CHESS_MAX_CONCURRENT_AI", "2")))
+
+
+def _client_ip() -> str:
+    fwd = request.headers.get("X-Forwarded-For", "")
+    return (fwd.split(",")[0].strip() if fwd else request.remote_addr) or "unknown"
+
+
+def _rate_limited() -> bool:
+    now = time.time()
+    ip = _client_ip()
+    with _rate_lock:
+        if len(_rate_buckets) > 10_000:      # bound the limiter itself
+            _rate_buckets.clear()
+        q = _rate_buckets.setdefault(ip, deque())
+        while q and now - q[0] > 60.0:
+            q.popleft()
+        if len(q) >= RATE_LIMIT_PER_MIN:
+            return True
+        q.append(now)
+        return False
+
+
+def _drop_game(game_id: str):
+    """Remove a game from every live-session dict. Caller holds _sessions_lock."""
+    for d in (games, game_histories, game_difficulty, game_last_active, _game_locks):
+        d.pop(game_id, None)
+
+
+def _evict_stale():
+    """Archive and drop idle games; enforce the live-game cap. Caller holds
+    _sessions_lock. Replaces the old /api/new-game sweep that archived EVERY
+    in-progress game — one player starting a game used to end everyone else's."""
+    now = time.time()
+    stale = [gid for gid, t in game_last_active.items() if now - t > GAME_TTL_S]
+    for gid in stale:
+        _archive_game(gid, games[gid])
+        _drop_game(gid)
+    if len(games) > MAX_LIVE_GAMES:
+        oldest = sorted(game_last_active, key=game_last_active.get)
+        for gid in oldest[:len(games) - MAX_LIVE_GAMES]:
+            _archive_game(gid, games[gid])
+            _drop_game(gid)
 
 
 def _get_evaluation(board: chess.Board) -> float:
@@ -224,21 +300,22 @@ def piece_image(piece):
 @app.route("/api/new-game", methods=["POST"])
 def new_game():
     """Start a new game. Accepts optional {"difficulty": "easy|medium|hard"}."""
+    if _rate_limited():
+        return jsonify({"error": "Rate limit exceeded — slow down"}), 429
     data = request.get_json(silent=True) or {}
     difficulty = data.get("difficulty", "hard")
     if difficulty not in DIFFICULTY_PRESETS:
         difficulty = "hard"
 
-    # Archive any existing games that haven't been archived yet
-    for old_id, old_board in list(games.items()):
-        if old_id not in [g["game_id"] for g in completed_games]:
-            _archive_game(old_id, old_board)
-
     game_id = uuid.uuid4().hex[:12]
     board = chess.Board()
-    games[game_id] = board
-    game_histories[game_id] = []
-    game_difficulty[game_id] = difficulty
+    with _sessions_lock:
+        _evict_stale()
+        games[game_id] = board
+        game_histories[game_id] = []
+        game_difficulty[game_id] = difficulty
+        game_last_active[game_id] = time.time()
+        _game_locks[game_id] = threading.Lock()
     return jsonify(board_to_json(board, game_id))
 
 
@@ -249,16 +326,42 @@ def make_move():
 
     Expects JSON: {"game_id": "...", "move": "e2e4"}
     """
+    if _rate_limited():
+        return jsonify({"error": "Rate limit exceeded — slow down"}), 429
     data = request.get_json(force=True)
     game_id = data.get("game_id")
-    uci_str = data.get("move", "")
+    uci_str = str(data.get("move", ""))
 
-    board = games.get(game_id)
-    if board is None:
+    with _sessions_lock:
+        board = games.get(game_id)
+        lock = _game_locks.get(game_id)
+    if board is None or lock is None:
         return jsonify({"error": "Game not found"}), 404
 
+    # One request per game at a time. Without this, a double-submit races two
+    # threads on the same mutable chess.Board mid-push. The timeout covers a
+    # full hard move plus queueing; hitting it means a move is still running.
+    if not lock.acquire(timeout=15):
+        return jsonify({"error": "A move is already being processed for this game"}), 409
+    try:
+        return _apply_move(game_id, board, uci_str)
+    finally:
+        lock.release()
+
+
+def _apply_move(game_id: str, board: chess.Board, uci_str: str):
+    """The /api/move body, entered holding the game's lock."""
     if board.is_game_over():
         return jsonify({"error": "Game is already over", **board_to_json(board, game_id)}), 400
+
+    # The human plays White everywhere in this app (history colours, resign logic).
+    # If it is not White's turn, the previous request is mid-flight or something
+    # desynced — applying a "human" move now would have the AI answer for the
+    # wrong side.
+    if board.turn != chess.WHITE:
+        return jsonify({"error": "Not your turn"}), 409
+
+    game_last_active[game_id] = time.time()
 
     # --- Validate & apply human move ---
     try:
@@ -267,13 +370,22 @@ def make_move():
         return jsonify({"error": f"Invalid UCI string: {uci_str}"}), 400
 
     if human_move not in board.legal_moves:
-        for promo in ["q", "r", "b", "n"]:
-            promo_move = chess.Move.from_uci(uci_str[:4] + promo)
-            if promo_move in board.legal_moves:
-                human_move = promo_move
-                break
-        else:
+        # Bare promotions arrive as e7e8; retry with a suffix. Everything in the
+        # retry is inside the try: "0000" parses as the null move above (no
+        # exception), fails the legality check, and then "0000q" used to raise
+        # OUTSIDE any handler — an uncaught 500 from a one-token request body.
+        promoted = None
+        try:
+            for promo in ("q", "r", "b", "n"):
+                promo_move = chess.Move.from_uci(uci_str[:4] + promo)
+                if promo_move in board.legal_moves:
+                    promoted = promo_move
+                    break
+        except ValueError:
+            pass
+        if promoted is None:
             return jsonify({"error": f"Illegal move: {uci_str}"}), 400
+        human_move = promoted
 
     san_human = board.san(human_move)
     board.push(human_move)
@@ -315,9 +427,16 @@ def make_move():
                          and board.piece_at(sq).piece_type != chess.KING)
     player = _make_player(difficulty, lone_king=(opponent_pieces == 0))
 
-    start = time.time()
-    ai_move = player.select_move(board)
-    elapsed_ms = int((time.time() - start) * 1000)
+    # Bound concurrent searches (each is seconds of GIL-held CPU). Refusing fast
+    # under overload beats queueing everyone into timeouts.
+    if not _AI_SLOTS.acquire(timeout=20):
+        return jsonify({"error": "Server is at capacity, try again shortly"}), 503
+    try:
+        start = time.time()
+        ai_move = player.select_move(board)
+        elapsed_ms = int((time.time() - start) * 1000)
+    finally:
+        _AI_SLOTS.release()
 
     if ai_move is None:
         _archive_game(game_id, board)
@@ -348,9 +467,12 @@ def get_state():
 
 
 def _archive_game(game_id: str, board: chess.Board):
-    """Save a completed game to the archive."""
-    if any(g["game_id"] == game_id for g in completed_games):
+    """Save a completed game to the archive (capped; O(1) duplicate check)."""
+    if game_id in _archived_ids:
         return  # Already archived
+    if len(completed_games) >= COMPLETED_GAMES_CAP:
+        _archived_ids.discard(completed_games.popleft()["game_id"])
+    _archived_ids.add(game_id)
     result = board.result() if board.is_game_over() else "*"
     outcome = board.outcome()
     completed_games.append({
@@ -367,8 +489,17 @@ def _archive_game(game_id: str, board: chess.Board):
 
 @app.route("/api/games", methods=["GET"])
 def list_games():
-    """List all completed games."""
-    return jsonify({"games": completed_games})
+    """List completed games — admin only.
+
+    This used to be public and returned every game_id with full histories, and a
+    game_id is the ONLY credential the other routes ask for: listing them handed
+    any visitor spectate-and-interfere access to every session. No admin token
+    configured means nobody gets in, not everybody.
+    """
+    token = os.environ.get("CHESS_ADMIN_TOKEN")
+    if not token or request.headers.get("X-Admin-Token") != token:
+        return jsonify({"error": "Not authorized"}), 403
+    return jsonify({"games": list(completed_games)})
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +507,10 @@ def list_games():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("\n=== Chess AI Web Server ===")
-    print("Open http://localhost:5000 in your browser to play!\n")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    # Dev convenience only. Production runs `python serve.py` (waitress, $PORT) —
+    # Flask's dev server is single-threaded-ish and not meant to face the internet.
+    port = int(os.environ.get("PORT", "5000"))
+    print("\n=== Chess AI Web Server (dev) ===")
+    print(f"Open http://localhost:{port} in your browser to play!")
+    print("Production: python serve.py\n")
+    app.run(host="0.0.0.0", port=port, debug=False)
