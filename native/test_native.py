@@ -71,6 +71,15 @@ def check_position(board, failures, tag):
     native_eval = ck.evaluate_raw(*args, board.fullmove_number)
     if native_eval != ref_eval:
         failures.append((tag, board.fen(), "evaluate_raw", ref_eval, native_eval))
+    # The full quiescence search, raw centipawns. `claimable` is computed here
+    # exactly as the production wrapper will compute it (draw probe stays in
+    # Python for v1). Any mismatch is either a port bug or the tie-order/delta
+    # interaction the C++ comment describes — both are stop-the-line findings.
+    claimable = board.can_claim_draw()
+    ref_q = evaluation._quiescence(board, 2, -100000, 100000, True)
+    native_q = ck.qsearch(*args, board.fullmove_number, 2, claimable)
+    if native_q != ref_q:
+        failures.append((tag, board.fen(), "qsearch", ref_q, native_q))
 
 
 # Positions that exercise each evaluate_raw term the middlegame suite cannot:
@@ -81,7 +90,12 @@ EVAL_POSITIONS = [
     ("kk",            "8/8/8/4k3/8/8/4K3/8 w - - 0 40"),
     ("kn-k",          "8/8/8/4k3/8/3N4/4K3/8 w - - 0 40"),
     ("kb-k",          "8/8/8/4k3/8/3B4/4K3/8 b - - 0 40"),
-    ("knn-k",         "8/8/8/4k3/8/2NN4/4K3/8 w - - 0 40"),
+    ("knn-k",         "8/8/8/4k3/8/1NN5/4K3/8 w - - 0 40"),
+    # ILLEGAL on purpose (Nd3 attacks the king with White to move): python-chess
+    # tolerates it and allows capturing the king, which reaches a KINGLESS
+    # board. The first sweep of this file found exactly that as UB in the
+    # kernel; it stays as a permanent robustness case.
+    ("knn-k-illegal", "8/8/8/4k3/8/2NN4/4K3/8 w - - 0 40"),
     ("kn-kn",         "8/8/8/3nk3/8/3N4/4K3/8 w - - 0 40"),
     ("kb-kb-same",    "8/8/8/3bk3/8/3B4/4K3/8 w - - 0 40"),
     ("kb-kb-opp",     "8/8/8/3bk3/8/4B3/4K3/8 w - - 0 40"),

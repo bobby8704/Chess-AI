@@ -132,6 +132,12 @@ static inline int king_sq(const Pos &p, int c) {
 }
 
 static inline bool in_check_(const Pos &p, int c) {
+    // Kingless boards are reachable in ILLEGAL positions (python-chess lets
+    // you capture a king that was left attacked with the wrong side to move,
+    // and its is_check() then reports False). Real play can never get here,
+    // but the differential harness proved BitScanForward on an empty king
+    // bitboard is garbage-in-garbage-out, so match python-chess exactly.
+    if (!p.pc[c][K]) return false;
     return square_attacked(p, king_sq(p, c), c ^ 1);
 }
 
@@ -275,6 +281,7 @@ static void gen_pseudo(const Pos &p, std::vector<Move> &out) {
     gen_from_mask(p.pc[us][K], [&](int s) { return KING_ATK[s]; });
 
     // Castling (standard chess). Rights bitboard holds rook home squares.
+    if (!p.pc[us][K]) return;                   // kingless: nothing to castle
     int ks = king_sq(p, us);
     int home = (us == 0) ? 4 : 60;              // e1 / e8
     if (ks == home && !in_check_(p, us)) {
@@ -573,11 +580,12 @@ static int checkmate_forcing(const Pos &p, int strong) {
     return score;
 }
 
-static int evaluate_raw_(const Pos &p, int fullmove) {
-    bool chk = in_check_(p, p.stm);
-    if (!has_legal_move(p)) return chk ? -30000 : 0;      // mate / stalemate
-    if (side_insufficient(p, 0) && side_insufficient(p, 1)) return 0;
-
+// The scoring body, AFTER the terminal checks. qsearch calls this directly:
+// by the time stand-pat is computed the search has already established that
+// legal moves exist and material is sufficient, exactly as Python's
+// _quiescence has before it calls _evaluate_raw — whose own re-checks then
+// fall through. Skipping the re-check is identical by construction.
+static int evaluate_raw_core(const Pos &p, int fullmove) {
     int score = 0;
     double egw = game_phase(p);
     for (int c = 0; c < 2; ++c) {
@@ -600,6 +608,80 @@ static int evaluate_raw_(const Pos &p, int fullmove) {
     if (popcnt(p.pc[0][B]) >= 2) score += 30;
     if (popcnt(p.pc[1][B]) >= 2) score -= 30;
     return (p.stm == 1) ? -score : score;
+}
+
+static int evaluate_raw_(const Pos &p, int fullmove) {
+    bool chk = in_check_(p, p.stm);
+    if (!has_legal_move(p)) return chk ? -30000 : 0;      // mate / stalemate
+    if (side_insufficient(p, 0) && side_insufficient(p, 1)) return 0;
+    return evaluate_raw_core(p, fullmove);
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1c: the quiescence search itself (evaluation.py:641 _quiescence).
+// Captures+promotions alpha-beta, depth 2, MVV-LVA order, 200cp delta
+// pruning. Returns raw centipawns — the tanh stays in Python so the value
+// path never depends on which libm the extension was linked against.
+//
+// The root draw claim (can_claim_draw) stays in Python for v1: the caller
+// computes it and passes `claimable`, and the check is applied at exactly
+// the point in the sequence Python applies it.
+//
+// Move ordering: Python stable-sorts by -(victim - attacker + promo) with
+// ties left in python-chess generation order; the native sort breaks ties by
+// (from, to, promo) instead. Alpha-beta's fail-hard value is order-invariant
+// over a fixed move set, but delta pruning at child nodes is window-dependent,
+// so tie order COULD in principle shift a value — whether it ever does on
+// real positions is exactly what the differential harness measures. If it
+// reports mismatches, the fix is replicating python-chess's generation order,
+// not weakening the gate.
+// ---------------------------------------------------------------------------
+
+static int qsearch(const Pos &p, int depth, int alpha, int beta, bool root,
+                   bool claimable, int fullmove) {
+    bool chk = in_check_(p, p.stm);
+    std::vector<Move> legal = gen_legal(p);
+    if (legal.empty()) return chk ? -30000 : 0;
+    if (side_insufficient(p, 0) && side_insufficient(p, 1)) return 0;
+    if (root && claimable) return 0;
+
+    int stand_pat = evaluate_raw_core(p, fullmove);
+    if (depth <= 0) return stand_pat;
+    if (stand_pat >= beta) return beta;
+    if (stand_pat > alpha) alpha = stand_pat;
+
+    struct Cand { int key; Move m; };
+    std::vector<Cand> cands;
+    cands.reserve(16);
+    for (const Move &m : legal) {
+        if (!is_qmove(p, m)) continue;
+        // Victim from the target square only: an en-passant victim is not on
+        // `to`, and Python's piece_at(to) -> None makes its value 0 there too.
+        int victim_val = 0;
+        if (p.occ[p.stm ^ 1] & bit(m.to))
+            victim_val = PIECE_CP[piece_on(p, p.stm ^ 1, m.to)];
+        if (stand_pat + victim_val + 200 < alpha && !m.promo) continue;
+        int attacker_val = PIECE_CP[piece_on(p, p.stm, m.from)];
+        int promo_val = (m.promo == 5) ? 800 : 0;      // queen promotions only
+        cands.push_back({-(victim_val - attacker_val + promo_val), m});
+    }
+    std::stable_sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b) {
+        if (a.key != b.key) return a.key < b.key;
+        if (a.m.from != b.m.from) return a.m.from < b.m.from;
+        if (a.m.to != b.m.to) return a.m.to < b.m.to;
+        return a.m.promo < b.m.promo;
+    });
+
+    for (const Cand &c : cands) {
+        Pos child = make_move(p, c.m);
+        // python-chess increments fullmove_number after Black's move.
+        int child_fullmove = fullmove + (p.stm == 1 ? 1 : 0);
+        int score = -qsearch(child, depth - 1, -beta, -alpha, false, false,
+                             child_fullmove);
+        if (score >= beta) return beta;
+        if (score > alpha) alpha = score;
+    }
+    return alpha;
 }
 
 // ---------------------------------------------------------------------------
@@ -686,6 +768,14 @@ static int py_evaluate_raw(u64 pawns, u64 knights, u64 bishops, u64 rooks,
     return evaluate_raw_(p, fullmove);
 }
 
+static int py_qsearch(u64 pawns, u64 knights, u64 bishops, u64 rooks,
+        u64 queens, u64 kings, u64 occ_w, u64 occ_b, int stm, int ep,
+        u64 castling, int fullmove, int max_depth, bool claimable) {
+    Pos p = unpack(pawns, knights, bishops, rooks, queens, kings,
+                   occ_w, occ_b, stm, ep, castling);
+    return qsearch(p, max_depth, -100000, 100000, true, claimable, fullmove);
+}
+
 PYBIND11_MODULE(chesskernel, m) {
     m.doc() = "Native leaf-evaluation kernel (stage 1: board + legal movegen)";
     m.def("legal_moves", &py_legal_moves);
@@ -694,4 +784,5 @@ PYBIND11_MODULE(chesskernel, m) {
     m.def("has_legal", &py_has_legal);
     m.def("perft", &py_perft);
     m.def("evaluate_raw", &py_evaluate_raw);
+    m.def("qsearch", &py_qsearch);
 }
