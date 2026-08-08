@@ -15,6 +15,14 @@ CHESS_MAX_LIVE_GAMES, CHESS_GAME_TTL_S, CHESS_TABLEBASE, CHESS_ADMIN_TOKEN.
 """
 
 import os
+import sys
+
+# Line-buffer BOTH streams before app import (app prints its model resolution at
+# import time). Piped stdout — every log collector, Render included — is otherwise
+# block-buffered by Python, so the lines that prove WHICH model is being served sat
+# invisible in a 4KB buffer while onnxruntime's unbuffered C++ stderr got through.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 from waitress import serve
 

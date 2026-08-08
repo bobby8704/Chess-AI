@@ -27,6 +27,10 @@ services:
       - key: PYTHON_VERSION
         # Exactly the interpreter the engine is developed and measured against.
         value: 3.12.10
+      - key: PYTHONUNBUFFERED
+        # Belt to serve.py's line-buffering braces: covers subprocesses too, so
+        # build-gate output and any future child process logs arrive live.
+        value: "1"
       - key: CHESS_MAX_CONCURRENT_AI
         # One search at a time on a small instance: two would halve each other
         # inside the GIL and both budgets would buy half the simulations.

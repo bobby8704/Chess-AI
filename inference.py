@@ -149,10 +149,17 @@ def resolve_onnx_path():
     guards against for checkpoint-vs-export, one level further down the chain.
     """
     fp32 = os.path.join(_MODELS_DIR, "dual_model_mcts_fp32.onnx")
+    # The staleness this guards against starts at the torch checkpoint: re-export
+    # fp32, forget to re-quantise, serve an int8 built from old weights. With no
+    # checkpoint on disk — the deployment shape, clones track only the .onnx files —
+    # nothing can have been re-exported, and clone mtimes are write-order accidents:
+    # the first Render deploy served int8 only because git happened to write fp32
+    # first. Trust committed files there; keep guarding dev machines.
+    dev_machine = os.path.exists(DEFAULT_CKPT_PATH)
     for path in onnx_candidates():
         if not os.path.exists(path):
             continue
-        if (path.endswith("_int8.onnx") and os.path.exists(fp32)
+        if (dev_machine and path.endswith("_int8.onnx") and os.path.exists(fp32)
                 and os.path.getmtime(fp32) > os.path.getmtime(path)):
             print(f"WARNING: {os.path.basename(fp32)} is newer than "
                   f"{os.path.basename(path)} - the int8 quantisation is stale, so it is "
