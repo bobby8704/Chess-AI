@@ -27,6 +27,7 @@ sys.path.insert(0, _HERE)
 import chess
 
 import chesskernel as ck
+import evaluation
 
 
 def pack(board: chess.Board):
@@ -66,7 +67,35 @@ def check_position(board, failures, tag):
         failures.append((tag, board.fen(), "in_check", board.is_check(), None))
     if ck.has_legal(*args) != any(board.generate_legal_moves()):
         failures.append((tag, board.fen(), "has_legal", None, None))
+    ref_eval = evaluation._evaluate_raw(board)
+    native_eval = ck.evaluate_raw(*args, board.fullmove_number)
+    if native_eval != ref_eval:
+        failures.append((tag, board.fen(), "evaluate_raw", ref_eval, native_eval))
 
+
+# Positions that exercise each evaluate_raw term the middlegame suite cannot:
+# every insufficient-material clause, checkmate-forcing with a lone king,
+# back-rank traps on both sides of the fullmove gate, mate and stalemate
+# terminals, and phase-boundary material levels.
+EVAL_POSITIONS = [
+    ("kk",            "8/8/8/4k3/8/8/4K3/8 w - - 0 40"),
+    ("kn-k",          "8/8/8/4k3/8/3N4/4K3/8 w - - 0 40"),
+    ("kb-k",          "8/8/8/4k3/8/3B4/4K3/8 b - - 0 40"),
+    ("knn-k",         "8/8/8/4k3/8/2NN4/4K3/8 w - - 0 40"),
+    ("kn-kn",         "8/8/8/3nk3/8/3N4/4K3/8 w - - 0 40"),
+    ("kb-kb-same",    "8/8/8/3bk3/8/3B4/4K3/8 w - - 0 40"),
+    ("kb-kb-opp",     "8/8/8/3bk3/8/4B3/4K3/8 w - - 0 40"),
+    ("kn-kr",         "8/8/8/3rk3/8/3N4/4K3/8 w - - 0 40"),
+    ("kq-k-forcing",  "8/8/8/4k3/8/8/4K3/4Q3 w - - 0 40"),
+    ("kr-k-forcing",  "8/8/4k3/8/8/8/4K3/7R b - - 0 40"),
+    ("kq-k-corner",   "k7/8/1K6/8/8/8/8/7Q b - - 0 60"),
+    ("backrank-trap", "6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 20"),
+    ("backrank-early","6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 5"),
+    ("backrank-mate", "R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 30"),
+    ("stalemate",     "7k/5Q2/6K1/8/8/8/8/8 b - - 0 40"),
+    ("phase-mid",     "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2N2N2/PPPP1PPP/R1BQK2R w KQkq - 0 6"),
+    ("promo-race",    "8/P6k/8/8/8/8/p6K/8 w - - 0 50"),
+]
 
 # Classic perft positions — the standard traps: castling through attack,
 # en-passant pins, promotions, discovered checks.
@@ -120,6 +149,11 @@ def main():
                 check_position(walk, failures, e["name"] + "-walk")
                 checked += 1
 
+    for name, fen in EVAL_POSITIONS:
+        board = chess.Board(fen)
+        check_position(board, failures, name)
+        checked += 1
+
     if not args.quick:
         for name, fen, depth in PERFT_POSITIONS:
             board = chess.Board(fen)
@@ -140,7 +174,8 @@ def main():
         for f_ in failures[:20]:
             print("  ", f_)
         return 1
-    print("native movegen agrees with python-chess on every position")
+    print("native movegen AND evaluate_raw agree with the Python reference "
+          "on every position")
     return 0
 
 

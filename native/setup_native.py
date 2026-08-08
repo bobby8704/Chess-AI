@@ -17,9 +17,12 @@ import pybind11
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 if sys.platform == "win32":
-    cflags = ["/O2", "/std:c++17", "/EHsc"]
+    # /fp:strict: the evaluate_raw port must match Python's IEEE-double results
+    # bit for bit, and contraction into FMA would change the king-PST phase
+    # blend by an ulp — enough to flip an int() truncation.
+    cflags = ["/O2", "/std:c++17", "/EHsc", "/fp:strict"]
 else:
-    cflags = ["-O2", "-std=c++17"]
+    cflags = ["-O2", "-std=c++17", "-ffp-contract=off"]
 
 setup(
     name="chesskernel",

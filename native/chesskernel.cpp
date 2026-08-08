@@ -14,7 +14,9 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <tuple>
 #include <vector>
 
@@ -327,6 +329,280 @@ static inline bool is_qmove(const Pos &p, const Move &m) {
 }
 
 // ---------------------------------------------------------------------------
+// Stage 1b: _evaluate_raw (evaluation.py:736) — the quiescence stand-pat.
+// 28.4% of every move, ~80k calls (bench/results/profile_move_1300.json).
+// Every table is verbatim from evaluation.py; every arithmetic quirk — the
+// (int) truncation toward zero, the king PST phase blend order, the per-king
+// truncation inside the material loop — replicates Python exactly, because
+// the differential gate demands integer equality on every position. The
+// build uses /fp:strict (-ffp-contract=off) so the compiler cannot fuse the
+// blend into FMA and change the double result by an ulp.
+// ---------------------------------------------------------------------------
+
+static inline int get_lsb(u64 b) {
+#ifdef _MSC_VER
+    unsigned long i; _BitScanForward64(&i, b); return (int)i;
+#else
+    return __builtin_ctzll(b);
+#endif
+}
+
+static inline int popcnt(u64 b) {
+#ifdef _MSC_VER
+    return (int)__popcnt64(b);
+#else
+    return __builtin_popcountll(b);
+#endif
+}
+
+static const int PIECE_CP[6] = {100, 320, 330, 500, 900, 0};
+
+// fmt matches evaluation.py:45-120 line for line.
+static const int PST_PAWN_T[64] = {
+     0,  0,  0,  0,  0,  0,  0,  0,
+    50, 50, 50, 50, 50, 50, 50, 50,
+    10, 10, 20, 30, 30, 20, 10, 10,
+     5,  5, 10, 25, 25, 10,  5,  5,
+     0,  0,  0, 20, 20,  0,  0,  0,
+     5, -5,-10,  0,  0,-10, -5,  5,
+     5, 10, 10,-20,-20, 10, 10,  5,
+     0,  0,  0,  0,  0,  0,  0,  0,
+};
+static const int PST_KNIGHT_T[64] = {
+   -50,-40,-30,-30,-30,-30,-40,-50,
+   -40,-20,  0,  0,  0,  0,-20,-40,
+   -30,  0, 10, 15, 15, 10,  0,-30,
+   -30,  5, 15, 20, 20, 15,  5,-30,
+   -30,  0, 15, 20, 20, 15,  0,-30,
+   -30,  5, 10, 15, 15, 10,  5,-30,
+   -40,-20,  0,  5,  5,  0,-20,-40,
+   -50,-40,-30,-30,-30,-30,-40,-50,
+};
+static const int PST_BISHOP_T[64] = {
+   -20,-10,-10,-10,-10,-10,-10,-20,
+   -10,  0,  0,  0,  0,  0,  0,-10,
+   -10,  0,  5, 10, 10,  5,  0,-10,
+   -10,  5,  5, 10, 10,  5,  5,-10,
+   -10,  0, 10, 10, 10, 10,  0,-10,
+   -10, 10, 10, 10, 10, 10, 10,-10,
+   -10,  5,  0,  0,  0,  0,  5,-10,
+   -20,-10,-10,-10,-10,-10,-10,-20,
+};
+static const int PST_ROOK_T[64] = {
+     0,  0,  0,  0,  0,  0,  0,  0,
+     5, 10, 10, 10, 10, 10, 10,  5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+     0,  0,  0,  5,  5,  0,  0,  0,
+};
+static const int PST_QUEEN_T[64] = {
+   -20,-10,-10, -5, -5,-10,-10,-20,
+   -10,  0,  0,  0,  0,  0,  0,-10,
+   -10,  0,  5,  5,  5,  5,  0,-10,
+    -5,  0,  5,  5,  5,  5,  0, -5,
+     0,  0,  5,  5,  5,  5,  0, -5,
+   -10,  5,  5,  5,  5,  5,  0,-10,
+   -10,  0,  5,  0,  0,  0,  0,-10,
+   -20,-10,-10, -5, -5,-10,-10,-20,
+};
+static const int PST_KING_MG_T[64] = {
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -20,-30,-30,-40,-40,-30,-30,-20,
+   -10,-20,-20,-20,-20,-20,-20,-10,
+    20, 20,  0,  0,  0,  0, 20, 20,
+    20, 30, 10,  0,  0, 10, 30, 20,
+};
+static const int PST_KING_EG_T[64] = {
+   -50,-40,-30,-20,-20,-30,-40,-50,
+   -30,-20,-10,  0,  0,-10,-20,-30,
+   -30,-10, 20, 30, 30, 20,-10,-30,
+   -30,-10, 30, 40, 40, 30,-10,-30,
+   -30,-10, 30, 40, 40, 30,-10,-30,
+   -30,-10, 20, 30, 30, 20,-10,-30,
+   -30,-30,  0,  0,  0,  0,-30,-30,
+   -50,-30,-30,-30,-30,-30,-30,-50,
+};
+static const int CENTER_DIST[64] = {
+    3, 2, 2, 2, 2, 2, 2, 3,
+    2, 1, 1, 1, 1, 1, 1, 2,
+    2, 1, 0, 0, 0, 0, 1, 2,
+    2, 1, 0, 0, 0, 0, 1, 2,
+    2, 1, 0, 0, 0, 0, 1, 2,
+    2, 1, 0, 0, 0, 0, 1, 2,
+    2, 1, 1, 1, 1, 1, 1, 2,
+    3, 2, 2, 2, 2, 2, 2, 3,
+};
+
+static const u64 FILE_A = 0x0101010101010101ULL;
+static const u64 BB_LIGHT = 0x55aa55aa55aa55aaULL;
+static const u64 BB_DARK  = 0xaa55aa55aa55aa55ULL;
+
+// python-chess has_insufficient_material, read from the installed source
+// (chess/__init__.py:2117) rather than remembered: the knight clause requires
+// the OPPONENT to hold nothing beyond kings and queens (rooks break it), and
+// the bishop clause looks at ALL bishops on the board sharing a square colour
+// plus a global no-pawns no-knights condition.
+static bool side_insufficient(const Pos &p, int c) {
+    if (p.pc[c][P] | p.pc[c][R] | p.pc[c][Q]) return false;
+    if (p.pc[c][N]) {
+        u64 kings_q = p.pc[0][K] | p.pc[1][K] | p.pc[0][Q] | p.pc[1][Q];
+        return popcnt(p.occ[c]) <= 2 && !(p.occ[c ^ 1] & ~kings_q);
+    }
+    if (p.pc[c][B]) {
+        u64 bishops = p.pc[0][B] | p.pc[1][B];
+        bool same_color = !(bishops & BB_DARK) || !(bishops & BB_LIGHT);
+        u64 pawns = p.pc[0][P] | p.pc[1][P];
+        u64 knights = p.pc[0][N] | p.pc[1][N];
+        return same_color && !pawns && !knights;
+    }
+    return true;
+}
+
+static double game_phase(const Pos &p) {
+    int npm = 0;
+    for (int c = 0; c < 2; ++c)
+        npm += popcnt(p.pc[c][N]) * 320 + popcnt(p.pc[c][B]) * 330
+             + popcnt(p.pc[c][R]) * 500 + popcnt(p.pc[c][Q]) * 900;
+    if (npm >= 4000) return 0.0;
+    if (npm <= 1000) return 1.0;
+    return 1.0 - (npm - 1000) / 3000.0;
+}
+
+static int pst_value(int pt, int sq, int c, double egw) {
+    int idx = (c == 0) ? sq : (sq ^ 56);        // chess.square_mirror
+    if (pt == K) {
+        // Python: int(mg * (1 - w) + eg * w) — trunc toward zero, exact order.
+        double v = PST_KING_MG_T[idx] * (1.0 - egw) + PST_KING_EG_T[idx] * egw;
+        return (int)v;
+    }
+    switch (pt) {
+        case P: return PST_PAWN_T[idx];
+        case N: return PST_KNIGHT_T[idx];
+        case B: return PST_BISHOP_T[idx];
+        case R: return PST_ROOK_T[idx];
+        case Q: return PST_QUEEN_T[idx];
+    }
+    return 0;
+}
+
+static int pawn_structure(const Pos &p, int c) {
+    int score = 0;
+    u64 our = p.pc[c][P], opp = p.pc[c ^ 1][P];
+    int files_mask = 0;
+    for (u64 bb = our; bb; bb &= bb - 1)
+        files_mask |= 1 << file_of(get_lsb(bb));
+
+    for (u64 bb = our; bb; bb &= bb - 1) {
+        int sq = get_lsb(bb);
+        int f = file_of(sq), r = rank_of(sq);
+        if (our & (FILE_A << f) & ~bit(sq)) score -= 15;                 // doubled
+        bool neighbor = (f > 0 && (files_mask & (1 << (f - 1))))
+                     || (f < 7 && (files_mask & (1 << (f + 1))));
+        if (!neighbor) score -= 20;                                      // isolated
+        u64 span = 0;
+        for (int cf = (f > 0 ? f - 1 : 0); cf <= (f < 7 ? f + 1 : 7); ++cf)
+            span |= FILE_A << cf;
+        u64 ahead = (c == 0)
+            ? (r >= 7 ? 0ULL : ~((1ULL << ((r + 1) * 8)) - 1))           // ranks > r
+            : ((1ULL << (r * 8)) - 1);                                   // ranks < r
+        if (!(opp & span & ahead)) {                                     // passed
+            int adv = (c == 0) ? r - 1 : 6 - r;
+            score += 20 + adv * 15;
+        }
+    }
+    return score;
+}
+
+static int king_safety(const Pos &p, int c) {
+    if (!p.pc[c][K]) return 0;
+    int ks = king_sq(p, c);
+    int score = 0;
+    int kf = file_of(ks), kr = rank_of(ks);
+    int sr = (c == 0) ? kr + 1 : kr - 1;
+    if (sr >= 0 && sr <= 7) {
+        for (int f = (kf > 0 ? kf - 1 : 0); f <= (kf < 7 ? kf + 1 : 7); ++f) {
+            int sq = sr * 8 + f;
+            score += (p.pc[c][P] & bit(sq)) ? 15 : -15;   // shelter pawn or hole
+        }
+    }
+    if (!((p.pc[0][P] | p.pc[1][P]) & (FILE_A << kf))) score -= 30;      // open file
+    return score;
+}
+
+static int back_rank_safety(const Pos &p, int c, int fullmove) {
+    if (!p.pc[c][K]) return 0;
+    int ks = king_sq(p, c);
+    if (rank_of(ks) != ((c == 0) ? 0 : 7)) return 0;
+    if (fullmove < 8) return 0;
+    int kf = file_of(ks);
+    int er = (c == 0) ? 1 : 6;
+    for (int f = (kf > 0 ? kf - 1 : 0); f <= (kf < 7 ? kf + 1 : 7); ++f) {
+        int sq = er * 8 + f;
+        if (!(p.occ[c] & bit(sq)) && !square_attacked(p, sq, c ^ 1))
+            return 0;                                     // has an escape square
+    }
+    int rq = popcnt(p.pc[c ^ 1][R]) + popcnt(p.pc[c ^ 1][Q]);
+    return rq ? -80 * rq : 0;
+}
+
+static int checkmate_forcing(const Pos &p, int strong) {
+    int weak = strong ^ 1;
+    if (p.occ[weak] & ~p.pc[weak][K]) return 0;           // weak side has material
+    if (!p.pc[strong][Q] && !p.pc[strong][R]) return 0;   // need a Q or R to mate
+    if (!p.pc[weak][K] || !p.pc[strong][K]) return 0;
+    int wk = king_sq(p, weak), sk = king_sq(p, strong);
+    int score = CENTER_DIST[wk] * 150;
+    int kd = std::max(std::abs(file_of(wk) - file_of(sk)),
+                      std::abs(rank_of(wk) - rank_of(sk)));
+    score += (7 - kd) * 80;
+    int moves = 0;
+    for (int sq = 0; sq < 64; ++sq) {
+        int cd = std::max(std::abs(file_of(wk) - file_of(sq)),
+                          std::abs(rank_of(wk) - rank_of(sq)));
+        if (cd != 1) continue;
+        if (!square_attacked(p, sq, strong) && !(p.occ[weak] & bit(sq)))
+            ++moves;                                      // escape or capture square
+    }
+    score += (8 - moves) * 50;
+    return score;
+}
+
+static int evaluate_raw_(const Pos &p, int fullmove) {
+    bool chk = in_check_(p, p.stm);
+    if (!has_legal_move(p)) return chk ? -30000 : 0;      // mate / stalemate
+    if (side_insufficient(p, 0) && side_insufficient(p, 1)) return 0;
+
+    int score = 0;
+    double egw = game_phase(p);
+    for (int c = 0; c < 2; ++c) {
+        int sign = (c == 0) ? 1 : -1;
+        for (int pt = 0; pt < 6; ++pt)
+            for (u64 bb = p.pc[c][pt]; bb; bb &= bb - 1) {
+                int sq = get_lsb(bb);
+                score += sign * (PIECE_CP[pt] + pst_value(pt, sq, c, egw));
+            }
+    }
+    score += pawn_structure(p, 0);
+    score -= pawn_structure(p, 1);
+    double mgw = 1.0 - egw;
+    score += (int)(king_safety(p, 0) * mgw);              // Python int(): trunc to 0
+    score -= (int)(king_safety(p, 1) * mgw);
+    score += back_rank_safety(p, 0, fullmove);
+    score -= back_rank_safety(p, 1, fullmove);
+    score += checkmate_forcing(p, 0);
+    score -= checkmate_forcing(p, 1);
+    if (popcnt(p.pc[0][B]) >= 2) score += 30;
+    if (popcnt(p.pc[1][B]) >= 2) score -= 30;
+    return (p.stm == 1) ? -score : score;
+}
+
+// ---------------------------------------------------------------------------
 // Python interface
 // ---------------------------------------------------------------------------
 
@@ -402,6 +678,14 @@ static u64 py_perft(u64 pawns, u64 knights, u64 bishops, u64 rooks, u64 queens,
     return perft(p, depth);
 }
 
+static int py_evaluate_raw(u64 pawns, u64 knights, u64 bishops, u64 rooks,
+        u64 queens, u64 kings, u64 occ_w, u64 occ_b, int stm, int ep,
+        u64 castling, int fullmove) {
+    Pos p = unpack(pawns, knights, bishops, rooks, queens, kings,
+                   occ_w, occ_b, stm, ep, castling);
+    return evaluate_raw_(p, fullmove);
+}
+
 PYBIND11_MODULE(chesskernel, m) {
     m.doc() = "Native leaf-evaluation kernel (stage 1: board + legal movegen)";
     m.def("legal_moves", &py_legal_moves);
@@ -409,4 +693,5 @@ PYBIND11_MODULE(chesskernel, m) {
     m.def("in_check", &py_in_check);
     m.def("has_legal", &py_has_legal);
     m.def("perft", &py_perft);
+    m.def("evaluate_raw", &py_evaluate_raw);
 }
