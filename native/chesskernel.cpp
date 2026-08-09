@@ -164,6 +164,10 @@ static Pos make_move(const Pos &p, const Move &m) {
         n.pc[them][vic] &= ~tob;
         n.occ[them] &= ~tob;
         n.castling &= ~tob;                     // captured a rook with rights
+        if (vic == K)                           // king capture (illegal positions
+            n.castling &= (us == 0)             // only): python-chess clears the
+                ? ~0xFF00000000000000ULL        // captured side's rank rights
+                : ~0xFFULL;
     } else if (pt == P && m.to == p.ep && p.ep >= 0) {
         int vic_sq = (us == 0) ? m.to - 8 : m.to + 8;
         n.pc[them][P] &= ~bit(vic_sq);
@@ -286,15 +290,17 @@ static void gen_pseudo(const Pos &p, std::vector<Move> &out) {
     int home = (us == 0) ? 4 : 60;              // e1 / e8
     if (ks == home && !in_check_(p, us)) {
         int rank_base = (us == 0) ? 0 : 56;
-        // King side: rook on h-file, f and g empty, e/f/g not attacked.
-        if (p.castling & bit(rank_base + 7)) {
+        // King side: rook PRESENT on h-file (a FEN can carry rights for a rook
+        // that does not exist — python-chess filters those via
+        // clean_castling_rights, so we must too), f and g empty, e/f/g safe.
+        if ((p.castling & bit(rank_base + 7)) && (p.pc[us][R] & bit(rank_base + 7))) {
             if (!(all & (bit(rank_base + 5) | bit(rank_base + 6)))
                 && !square_attacked(p, rank_base + 5, them)
                 && !square_attacked(p, rank_base + 6, them))
                 out.push_back({home, rank_base + 6, 0});
         }
-        // Queen side: rook on a-file, b/c/d empty, c/d/e not attacked.
-        if (p.castling & bit(rank_base + 0)) {
+        // Queen side: rook present on a-file, b/c/d empty, c/d/e safe.
+        if ((p.castling & bit(rank_base + 0)) && (p.pc[us][R] & bit(rank_base + 0))) {
             if (!(all & (bit(rank_base + 1) | bit(rank_base + 2) | bit(rank_base + 3)))
                 && !square_attacked(p, rank_base + 2, them)
                 && !square_attacked(p, rank_base + 3, them))
@@ -685,6 +691,151 @@ static int qsearch(const Pos &p, int depth, int alpha, int beta, bool root,
 }
 
 // ---------------------------------------------------------------------------
+// Stage 1d (v1.1): can_claim_draw — the last ~200us of Python in the leaf.
+// Replicates python-chess 1.11.2's algorithm exactly, from its source:
+//   can_claim_draw = can_claim_fifty_moves or can_claim_threefold_repetition
+// The threefold walk pops the move stack while moves are reversible, counting
+// transposition keys, then also asks whether any LEGAL NEXT move reaches a
+// twice-seen key. Three source-read subtleties carried into this port:
+//   - push() CLEANS castling rights before every move, and clean_castling_
+//     rights() is stack-dependent: full filter at the stack base, passthrough
+//     everywhere else. The replay cleans the base once and stays raw after.
+//   - A key's ep component is the ep square only if a LEGAL en-passant
+//     capture exists there, else None.
+//   - is_irreversible is evaluated at the state BEFORE each popped move, and
+//     the state below an irreversible move is NOT counted.
+// board.promoted is treated as 0 (standard chess: kings are never promoted,
+// which is the only place the mask could matter here).
+// ---------------------------------------------------------------------------
+
+static u64 full_clean_rights(const Pos &p) {   // clean_castling_rights, stack empty
+    u64 castling = p.castling & (p.pc[0][R] | p.pc[1][R]);
+    u64 w = castling & 0xFFULL & p.occ[0] & (bit(0) | bit(7));
+    u64 b = castling & 0xFF00000000000000ULL & p.occ[1] & (bit(56) | bit(63));
+    if (!(p.occ[0] & p.pc[0][K] & bit(4)))  w = 0;   // king must be on e1
+    if (!(p.occ[1] & p.pc[1][K] & bit(60))) b = 0;   // king must be on e8
+    return w | b;
+}
+
+static bool has_legal_ep(const Pos &p) {
+    if (p.ep < 0) return false;
+    u64 capturers = p.pc[p.stm][P] & PAWN_ATK[p.stm ^ 1][p.ep];
+    for (u64 bb = capturers; bb; bb &= bb - 1) {
+        Move m{get_lsb(bb), p.ep, 0};
+        Pos n = make_move(p, m);
+        if (!in_check_(n, p.stm)) return true;
+    }
+    return false;
+}
+
+struct TKey {
+    u64 b[8];        // pawns knights bishops rooks queens kings occ_w occ_b
+    u64 castling;    // clean rights, per the stack-dependent rule
+    int turn;
+    int ep;          // ep square if a legal ep capture exists, else -1 (None)
+    bool operator==(const TKey &o) const {
+        for (int i = 0; i < 8; ++i) if (b[i] != o.b[i]) return false;
+        return castling == o.castling && turn == o.turn && ep == o.ep;
+    }
+};
+
+static TKey tkey(const Pos &p, bool stack_empty) {
+    TKey k;
+    k.b[0] = p.pc[0][P] | p.pc[1][P];
+    k.b[1] = p.pc[0][N] | p.pc[1][N];
+    k.b[2] = p.pc[0][B] | p.pc[1][B];
+    k.b[3] = p.pc[0][R] | p.pc[1][R];
+    k.b[4] = p.pc[0][Q] | p.pc[1][Q];
+    k.b[5] = p.pc[0][K] | p.pc[1][K];
+    k.b[6] = p.occ[0];
+    k.b[7] = p.occ[1];
+    k.castling = stack_empty ? full_clean_rights(p) : p.castling;
+    k.turn = p.stm;
+    k.ep = has_legal_ep(p) ? p.ep : -1;
+    return k;
+}
+
+static bool is_zeroing_(const Pos &p, const Move &m) {
+    u64 touched = bit(m.from) ^ bit(m.to);
+    return (touched & (p.pc[0][P] | p.pc[1][P]))
+        || (touched & p.occ[p.stm ^ 1]);
+}
+
+static bool reduces_castling_rights_(const Pos &p, const Move &m, bool stack_empty) {
+    u64 cr = stack_empty ? full_clean_rights(p) : p.castling;
+    u64 touched = bit(m.from) ^ bit(m.to);
+    return (touched & cr)
+        || ((cr & 0xFFULL) && (touched & p.pc[0][K]))
+        || ((cr & 0xFF00000000000000ULL) && (touched & p.pc[1][K]));
+}
+
+static bool is_irreversible_(const Pos &p, const Move &m, bool stack_empty) {
+    return is_zeroing_(p, m) || reduces_castling_rights_(p, m, stack_empty)
+        || has_legal_ep(p);
+}
+
+static bool can_claim_draw_(Pos base, const std::vector<Move> &moves,
+                            int halfmove_clock) {
+    // python-chess's first push cleans the base's rights, and the base state's
+    // own key uses the same filtered value — clean once, up front.
+    base.castling = full_clean_rights(base);
+
+    std::vector<Pos> states;                  // states[j] = position before moves[j]
+    states.reserve(moves.size() + 1);
+    states.push_back(base);
+    Pos cur = base;
+    for (const Move &m : moves) {
+        cur = make_move(cur, m);
+        states.push_back(cur);
+    }
+
+    // can_claim_fifty_moves: is_fifty_moves now (clock >= 100 with a legal
+    // move), OR — the clause the first differential sweep caught missing — a
+    // legal NON-ZEROING move at clock >= 99 that reaches it, where the child
+    // must itself still have a legal move (a mating/stalemating move does not
+    // earn the claim).
+    if (halfmove_clock >= 100 && has_legal_move(cur)) return true;
+    if (halfmove_clock >= 99) {
+        for (const Move &m : gen_legal(cur)) {
+            if (is_zeroing_(cur, m)) continue;
+            Pos child = make_move(cur, m);
+            if (has_legal_move(child)) return true;   // child clock >= 100
+        }
+    }
+
+    // Count keys: current position plus the walk back while moves reverse.
+    std::vector<TKey> keys;
+    std::vector<int> counts;
+    keys.reserve(moves.size() + 1);
+    auto add = [&](const TKey &k) {
+        for (size_t i = 0; i < keys.size(); ++i)
+            if (keys[i] == k) { ++counts[i]; return; }
+        keys.push_back(k);
+        counts.push_back(1);
+    };
+    auto count_of = [&](const TKey &k) -> int {
+        for (size_t i = 0; i < keys.size(); ++i)
+            if (keys[i] == k) return counts[i];
+        return 0;
+    };
+
+    TKey current_key = tkey(cur, moves.empty());
+    add(current_key);
+    for (int j = (int)moves.size() - 1; j >= 0; --j) {
+        if (is_irreversible_(states[j], moves[j], j == 0)) break;
+        add(tkey(states[j], j == 0));
+    }
+    if (count_of(current_key) >= 3) return true;
+
+    // The next legal move reaches a twice-seen position.
+    for (const Move &m : gen_legal(cur)) {
+        Pos child = make_move(cur, m);
+        if (count_of(tkey(child, false)) >= 2) return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Python interface
 // ---------------------------------------------------------------------------
 
@@ -776,6 +927,19 @@ static int py_qsearch(u64 pawns, u64 knights, u64 bishops, u64 rooks,
     return qsearch(p, max_depth, -100000, 100000, true, claimable, fullmove);
 }
 
+static bool py_can_claim_draw(u64 pawns, u64 knights, u64 bishops, u64 rooks,
+        u64 queens, u64 kings, u64 occ_w, u64 occ_b, int stm, int ep,
+        u64 castling, const std::vector<std::tuple<int, int, int>> &moves,
+        int halfmove_clock) {
+    Pos base = unpack(pawns, knights, bishops, rooks, queens, kings,
+                      occ_w, occ_b, stm, ep, castling);
+    std::vector<Move> ms;
+    ms.reserve(moves.size());
+    for (const auto &t : moves)
+        ms.push_back({std::get<0>(t), std::get<1>(t), std::get<2>(t)});
+    return can_claim_draw_(base, ms, halfmove_clock);
+}
+
 PYBIND11_MODULE(chesskernel, m) {
     m.doc() = "Native leaf-evaluation kernel (stage 1: board + legal movegen)";
     m.def("legal_moves", &py_legal_moves);
@@ -785,4 +949,5 @@ PYBIND11_MODULE(chesskernel, m) {
     m.def("perft", &py_perft);
     m.def("evaluate_raw", &py_evaluate_raw);
     m.def("qsearch", &py_qsearch);
+    m.def("can_claim_draw", &py_can_claim_draw);
 }

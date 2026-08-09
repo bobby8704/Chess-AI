@@ -663,8 +663,32 @@ if os.environ.get("CHESS_NATIVE", "1") != "0":
 
 
 def _evaluate_quiescence_native(board: chess.Board, max_depth: int = 2) -> float:
-    """evaluate_quiescence via the native kernel. Same contract, same values."""
-    claimable = board.can_claim_draw()
+    """evaluate_quiescence via the native kernel. Same contract, same values.
+
+    The draw-claim probe is also native (v1.1): the kernel replays the board's
+    (tree-truncated) move stack from the base state and runs python-chess's
+    exact claim algorithm, so the ~200us board.can_claim_draw() call — the
+    last Python cost in the leaf — is gone. board._stack is private API,
+    version-pinned by chess==1.11.2 in requirements; native/test_native.py is
+    the tripwire if an upgrade ever changes its shape.
+    """
+    stack = board.move_stack
+    if stack:
+        s = board._stack[0]
+        base = (s.pawns, s.knights, s.bishops, s.rooks, s.queens, s.kings,
+                s.occupied_w, s.occupied_b, 0 if s.turn else 1,
+                s.ep_square if s.ep_square is not None else -1,
+                s.castling_rights)
+        moves = [(m.from_square, m.to_square, m.promotion or 0) for m in stack]
+    else:
+        base = (board.pawns, board.knights, board.bishops, board.rooks,
+                board.queens, board.kings,
+                board.occupied_co[chess.WHITE], board.occupied_co[chess.BLACK],
+                0 if board.turn == chess.WHITE else 1,
+                board.ep_square if board.ep_square is not None else -1,
+                board.castling_rights)
+        moves = []
+    claimable = _native_kernel.can_claim_draw(*base, moves, board.halfmove_clock)
     cp = _native_kernel.qsearch(
         board.pawns, board.knights, board.bishops, board.rooks,
         board.queens, board.kings,

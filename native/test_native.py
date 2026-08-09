@@ -39,6 +39,23 @@ def pack(board: chess.Board):
             board.castling_rights)
 
 
+def pack_claim(board: chess.Board):
+    """Base state + move list + clock, exactly as the production wrapper packs it.
+
+    board._stack is private but version-pinned (chess==1.11.2) and this harness
+    is the tripwire if an upgrade ever changes it."""
+    if board.move_stack:
+        s = board._stack[0]
+        base = (s.pawns, s.knights, s.bishops, s.rooks, s.queens, s.kings,
+                s.occupied_w, s.occupied_b, 0 if s.turn else 1,
+                s.ep_square if s.ep_square is not None else -1, s.castling_rights)
+    else:
+        base = pack(board)
+    moves = [(m.from_square, m.to_square, m.promotion or 0)
+             for m in board.move_stack]
+    return base, moves, board.halfmove_clock
+
+
 def py_moves(board):
     return {(m.from_square, m.to_square, m.promotion or 0)
             for m in board.legal_moves}
@@ -76,6 +93,10 @@ def check_position(board, failures, tag):
     # Python for v1). Any mismatch is either a port bug or the tie-order/delta
     # interaction the C++ comment describes — both are stop-the-line findings.
     claimable = board.can_claim_draw()
+    base, mvs, clock = pack_claim(board)
+    native_claim = ck.can_claim_draw(*base, mvs, clock)
+    if native_claim != claimable:
+        failures.append((tag, board.fen(), "can_claim_draw", claimable, native_claim))
     ref_q = evaluation._quiescence(board, 2, -100000, 100000, True)
     native_q = ck.qsearch(*args, board.fullmove_number, 2, claimable)
     if native_q != ref_q:
@@ -167,6 +188,41 @@ def main():
         board = chess.Board(fen)
         check_position(board, failures, name)
         checked += 1
+
+    # Draw-claim scenarios the random walks cannot reliably construct. Each is
+    # checked with the FULL stack and with a TREE-truncated copy(stack=8) —
+    # the truncated board's own answer is the reference for the truncated case,
+    # exactly as the search sees it.
+    def claim_scenario(name, moves_san_or_uci, expect_note=""):
+        b = chess.Board()
+        for u in moves_san_or_uci:
+            b.push_uci(u)
+        for variant, bb in (("full", b), ("trunc8", b.copy(stack=8))):
+            check_position(bb, failures, f"{name}-{variant}")
+        return b
+
+    # Threefold complete: knights shuffle out and back twice (start seen 3x).
+    claim_scenario("rep3", ["g1f3", "g8f6", "f3g1", "f6g8",
+                            "g1f3", "g8f6", "f3g1", "f6g8"])
+    # Lookahead claim: one ply short — Black's next Ng8 completes the third.
+    claim_scenario("rep-lookahead", ["g1f3", "g8f6", "f3g1", "f6g8",
+                                     "g1f3", "g8f6", "f3g1"])
+    # A rook shuffle inside the window after a rights-reducing move: the walk
+    # must stop at the irreversible boundary.
+    claim_scenario("rights-boundary", ["e2e4", "e7e5", "g1f3", "g8f6",
+                                       "h1g1", "h8g8", "g1h1", "g8h8"])
+    # En-passant in the key: after the double push a legal capture exists, so
+    # the pre- and post-availability positions differ even with equal pieces.
+    claim_scenario("ep-key", ["e2e4", "g8f6", "e4e5", "d7d5"])
+    for name, fen in [
+        ("fifty-claim",  "8/8/8/4k3/8/4K3/4R3/8 w - - 100 80"),
+        ("fifty-almost", "8/8/8/4k3/8/4K3/4R3/8 w - - 99 80"),
+        ("unclean-fen",  "8/8/8/4k3/8/8/8/4K3 w KQkq - 0 1"),
+        ("unclean-rook", "8/8/8/4k3/8/8/8/R3K3 w KQkq - 0 10"),
+    ]:
+        check_position(chess.Board(fen), failures, name)
+        checked += 1
+    checked += 4 * 2  # the four claim scenarios, two variants each
 
     if not args.quick:
         for name, fen, depth in PERFT_POSITIONS:
